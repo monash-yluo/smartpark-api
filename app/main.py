@@ -62,6 +62,7 @@ log = logging.getLogger("smartpark.api")
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 加载本地config
     config = load_platform_config()
     app.state.config = config
     app.state.cache = TTLCache(default_ttl=config.request_cache_ttl_s)
@@ -71,6 +72,7 @@ async def lifespan(app: FastAPI):
     # 模型在运行时从磁盘加载(MODEL_PATH).若不可用(例如本地开发),
     # build_detector 会返回 MockDetector,使端点仍能启动并测试.在 GKE 上 MODEL_PATH 是挂载的 PVC.
     app.state.detector = build_detector(config.model_path, config.inference_workers)
+    # 异步 HTTP 客户端 主动去调 takephoto（Cloud Run）拉图
     app.state.http = httpx.AsyncClient(timeout=config.takephoto_timeout_s)
 
     log.info(
@@ -124,7 +126,9 @@ async def uuid_context(request, call_next):
     try:
         response = await call_next(request)
     finally:
+        # 计算时间 / Calculate elapsed time
         elapsed_ms = (time.perf_counter() - start) * 1000
+        # 记录访问日志:HTTP 方法,路径,状态码,耗时 / Log access: HTTP method, path, status code, elapsed time 
         log.info(
             "HTTP %s %s -> %s (%.1fms)",
             request.method,
