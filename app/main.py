@@ -36,15 +36,17 @@ import time
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .cache import TTLCache
 from .config import CarPark, load_platform_config
 from .inference import build_detector
 from .logging_utils import (
+    build_user_id,
     count_unique_users,
     current_uuid,
+    get_client_ip,
     log,
     log_request,
     resolve_uuid,
@@ -89,11 +91,35 @@ app = FastAPI(title="smartpark-api", version="1.0.0", lifespan=lifespan)
 # Middleware: inject the user/request UUID into the logging context and emit a
 # per-request access log line (timestamp | level | service | [uuid] | message).
 # 中间件:将用户/请求 UUID 注入日志上下文,并输出每条请求的访问日志行.
+#
+# @app.middleware("http") wraps the ASGI app, which sits at the APPLICATION layer.
+# TLS/HTTPS is a TRANSPORT-layer concern that is handled before this app sees the
+# request: locally uvicorn terminates TLS; in GKE the Ingress/LoadBalancer does.
+# So this middleware runs identically for http and https -- it only ever sees the
+# already-decrypted HTTP request.
+# @app.middleware("http") 包装的是应用层的 ASGI 应用.TLS/HTTPS 是传输层的事,
+# 由应用之前的一端处理:本地是 uvicorn 终止 TLS;GKE 上是 Ingress/LoadBalancer.
+# 因此该中间件对 http 和 https 一视同仁--它只会看到已解密的 HTTP 请求.
+#
+# We store the uuid in a ContextVar so that all logs emitted while handling this
+# request (a separate asyncio task with its own context) carry that uuid.
+# 我们把 uuid 存入一个 ContextVar,使该请求(一个拥有独立上下文的 asyncio 任务)
+# 处理期间发出的所有日志都带上这个 uuid.
 # ---------------------------------------------------------------------------
 @app.middleware("http")
 async def uuid_context(request, call_next):
-    uid = resolve_uuid(request.query_params.get("uuid"))
-    token = current_uuid.set(uid)
+    # Resolve a stable "user id": the client uuid if provided, else the client IP
+    # (so one user hitting the API multiple times groups to one id, not many).
+    # 解析一个稳定的"用户 id":优先用客户端 uuid,否则用客户端 IP
+    # (这样同一用户多次调用会归并为一个 id,而不会变成多个).
+    client_ip = get_client_ip(request)
+    request.state.client_ip = client_ip
+    user_id = build_user_id(request.query_params.get("uuid"), client_ip)
+    request.state.user_id = user_id
+    # set() the user id into THIS request's context and keep the Token so we can
+    # reset() it afterwards (restores the previous value, avoids leaking it).
+    # 把用户 id 写入"当前请求"的上下文,并保留 Token 以便之后 reset()(恢复旧值,避免泄漏).
+    token = current_uuid.set(user_id)
     start = time.perf_counter()
     try:
         response = await call_next(request)
@@ -164,10 +190,16 @@ async def _analyze_carpark(carpark: CarPark) -> dict | None:
 # ---------------------------------------------------------------------------
 @app.get("/api/find-carparks")
 async def find_carparks(
+    request: Request,
     uuid: str | None = Query(default=None, description="user uuid"),
     n: int = Query(default=3, ge=1, description="how many car parks to return"),
 ):
-    uid = resolve_uuid(uuid)
+    # raw uuid to echo back to the client (matches the spec output format).
+    # 回显给客户端的原始 uuid(对应作业输出格式).
+    raw_uuid = resolve_uuid(uuid)
+    # the stable grouping id set by the middleware (user:<uuid> or ip:<client-ip>).
+    # 中间件设置好的稳定分组 id(user:<uuid> 或 ip:<client-ip>).
+    user_id = request.state.user_id
     carparks = list(app.state.config.carparks)
     if not carparks:
         return JSONResponse(
@@ -187,7 +219,7 @@ async def find_carparks(
 
     # Repeated requests from the same user can be cached (per-pod).
     # 同一用户的重复请求可以被缓存(按 Pod).
-    cache_key = (uid, eff_n)
+    cache_key = (user_id, eff_n)
     cached = app.state.cache.get(cache_key)
     if cached is not None:
         cached["msg"] = "success (cached)"
@@ -203,7 +235,7 @@ async def find_carparks(
 
     elapsed_ms = (time.perf_counter() - start) * 1000
     payload = {
-        "uuid": uid,
+        "uuid": raw_uuid,
         "status": "success",
         "msg": "success",
         "speed_inference": f"{elapsed_ms:.0f} ms",
@@ -212,7 +244,7 @@ async def find_carparks(
         "results": top,
     }
     app.state.cache.set(cache_key, payload)
-    log_request(time.time(), uid, "find-carparks")
+    log_request(time.time(), user_id, "find-carparks")
     return payload
 
 
@@ -222,10 +254,13 @@ async def find_carparks(
 # ---------------------------------------------------------------------------
 @app.get("/api/annotate-carpark")
 async def annotate_carpark(
+    request: Request,
     carpark_id: str = Query(..., description="car park id, e.g. CBD_001"),
     uuid: str | None = Query(default=None, description="optional user uuid"),
 ):
-    uid = resolve_uuid(uuid)
+    # middleware-derived stable id (user:<uuid>, else ip:<client-ip>).
+    # 中间件得到的稳定 id(user:<uuid>,否则 ip:<client-ip>).
+    user_id = request.state.user_id
     carpark = app.state.config.carpark_by_id(carpark_id)
     if carpark is None:
         return JSONResponse(
@@ -248,7 +283,7 @@ async def annotate_carpark(
 
     analysis = await app.state.detector.analyze(image)
     b64 = base64.b64encode(analysis["annotated_png"]).decode("utf-8")
-    log_request(time.time(), uid, "annotate-carpark")
+    log_request(time.time(), user_id, "annotate-carpark")
 
     return {
         "carpark_id": carpark_id,

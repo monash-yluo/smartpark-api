@@ -75,6 +75,17 @@ MODEL_PATH to the model.pt / model.onnx file.
 7. Known caveat. OPS-API-2 counts from an in-memory request log, so it is per-pod.
    Across replicas each pod sees only its own traffic; a cluster-wide count would
    need shared storage (Redis / Cloud Logging).
+8. User identity: uuid with IP fallback. The platform needs a stable id so a user's
+   requests group together (for logging and OPS-API-2 user counting). If the client
+   supplies a uuid we use "user:<uuid>"; if not, we fall back to the client IP
+   ("ip:<client_ip>"), so one user making many requests (e.g. several annotate
+   calls) is counted once, not many times. The raw user uuid is still echoed back
+   in find-carparks responses. Behind a proxy / load-balancer (GKE Ingress, Cloud
+   Run) we read the real client from X-Forwarded-For (leftmost value), otherwise we
+   use the direct peer address (see get_client_ip in app/logging_utils.py).
+   NOTE: IP is a heuristic, not a true identity — NAT sharing under-counts, mobile
+   IP churn can over-count, and X-Forwarded-For should only be trusted from known
+   proxies.
 
 ## Next steps
 
