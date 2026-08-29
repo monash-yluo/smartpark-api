@@ -1,0 +1,84 @@
+# SmartPark — Main Platform API
+
+The graded, user-facing FastAPI service for FIT3184 2026 S2 Assignment 1.
+It is a **single monolith** that is horizontally scaled (1/2/4/8 replicas) on GKE
+behind a LoadBalancer and a CPU-based HPA. Locust hammers this service.
+
+It is **not** the takephoto camera simulator (that is the separate small service
+already deployed to Cloud Run; this platform pulls images from it).
+
+## Endpoints
+
+| API | Method + Path | Purpose |
+|-----|---------------|---------|
+| CORE-API-1 | GET /api/find-carparks?uuid=..&n=3 | Top n car parks by available spaces |
+| CORE-API-2 | GET /api/annotate-carpark?carpark_id=.. | Annotated image (base64) |
+| OPS-API-1  | GET /api/ops/carparks | All car parks + current free spaces |
+| OPS-API-2  | GET /api/ops/users | Distinct users in the last 30 s |
+| probe      | GET /healthz, GET /                     | Liveness / info |
+
+OPS-REQ-1 (request logging) is handled by the middleware + app/logging_utils.py.
+OPS-REQ-2 (operational dashboard) is intentionally deferred to a later step.
+
+## Project layout
+
+    smartpark-api/
+    ├─ app/
+    │  ├─ main.py          # FastAPI app + all routes + lifespan
+    │  ├─ config.py        # load car parks from carparks.json (single source of truth)
+    │  ├─ takephoto.py     # async HTTP client for the camera service
+    │  ├─ inference.py     # YOLO wrapper (runtime-loaded model, thread-pool async)
+    │  ├─ cache.py         # per-user TTL cache for repeated requests
+    │  └─ logging_utils.py # structured logging + uuid context + request log
+    ├─ config/carparks.json  # car park list (generated; becomes a GKE ConfigMap)
+    ├─ scripts/make_carparks.py  # regenerate carparks.json
+    ├─ requirements.txt
+    ├─ Dockerfile          # lightweight; model weights NOT baked in
+    ├─ .dockerignore / .gitignore
+    └─ README.md
+
+## Run locally
+
+    python -m venv .venv
+    .venv\Scripts\python -m pip install -r requirements.txt   # note: also installs ultralytics
+    .venv\Scripts\python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+If the model is not present the app falls back to a MockDetector so the endpoints
+still run (CPU counts are deterministic stand-ins). To use real YOLO, set
+MODEL_PATH to the model.pt / model.onnx file.
+
+## Configuration (env vars)
+
+- CARPARKS_CONFIG  path to carparks.json          (default ./config/carparks.json)
+- MODEL_PATH       path to the model weights      (default /models/model.pt)
+- TAKEPHOTO_TIMEOUT  seconds for camera calls     (default 10)
+- INFERENCE_WORKERS  YOLO thread-pool size        (default 4)
+- REQUEST_CACHE_TTL  per-user cache TTL seconds   (default 30)
+- PORT             listen port                    (default 8000)
+
+## Key design decisions (worth explaining in the interview)
+
+1. Car park discovery = single source of truth. The platform loads car parks from
+   carparks.json at startup. On GKE that JSON is a ConfigMap mounted into every
+   replica, so editing one place updates the whole cluster.
+2. Updateable model. Weights are NOT copied into the image. The app reads
+   MODEL_PATH at runtime (a mounted PVC on GKE), so swapping the file updates the
+   model without rebuilding the container.
+3. Inference does not block the event loop. YOLO is synchronous and CPU-bound, so
+   it runs on a ThreadPoolExecutor via loop.run_in_executor; the route just awaits
+   it (see app/inference.py). This is the core "bottleneck + mitigation" point.
+4. 2n sampling + concurrency. find-carparks samples 2*n car parks and pulls +
+   infers them concurrently (asyncio.gather), then returns the top n by free spaces.
+5. Per-user cache. Repeated (uuid, n) requests within the TTL are served from cache.
+6. Large n (what-if). n is clamped to the number of car parks, and at most 2*n are
+   sampled, so a huge n (e.g. 200) cannot be abused to hit the cameras/replicas.
+7. Known caveat. OPS-API-2 counts from an in-memory request log, so it is per-pod.
+   Across replicas each pod sees only its own traffic; a cluster-wide count would
+   need shared storage (Redis / Cloud Logging).
+
+## Next steps
+
+- OPS-REQ-2 dashboard (matplotlib on demand).
+- GKE manifests (namespace, ConfigMap, PVC for the model, Deployment, LoadBalancer
+  Service, HPA) and real deployment.
+- Locust script + benchmark report for 1/2/4/8 replicas.
