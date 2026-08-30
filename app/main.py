@@ -199,7 +199,14 @@ async def _analyze_carpark(carpark: CarPark) -> dict | None:
 @app.get("/api/find-carparks")
 async def find_carparks(
     request: Request,
-    uuid: str | None = Query(default=None, description="user uuid"),
+    # uuid is REQUIRED by CORE-API-1: "each simulated user has a uuid to associate
+    # the request with the response." FastAPI enforces presence + length and returns
+    # 422 (validation error) when it is missing / blank / too long.
+    # uuid 是 CORE-API-1 的必填参数(作业:每个模拟用户都带 uuid 关联请求与响应).
+    # 由 FastAPI 校验:缺失 / 空 / 超长时返回 422(校验错误).
+    uuid: str = Query(
+        ..., min_length=1, max_length=64, description="required user uuid"
+    ),
     n: int = Query(default=3, ge=1, description="how many car parks to return"),
 ):
     # raw uuid to echo back to the client (matches the spec output format).

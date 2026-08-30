@@ -2,6 +2,7 @@
 
 Verifies the change documented in doc/handoff-main-resilience.md:
 
+  * Scenario G: uuid is required by CORE-API-1        -> missing/blank/too-long uuid -> HTTP 422 (FastAPI)
   * Scenario A: EVERY sampled car park camera fails  -> HTTP 503
   * Scenario D: a single inference raises (unit)      -> _analyze_carpark returns None
   * Scenario E: EVERY inference raises (e2e)          -> HTTP 503
@@ -128,6 +129,32 @@ def run():
             print(f"  [PASS] {label}  {detail}")
         else:
             print(f"  [FAIL] {label}  {detail}")
+
+    # -------------------------------------------------------------- G: uuid ----
+    # CORE-API-1 requires uuid; FastAPI enforces it and returns 422 when missing /
+    # blank / too long (validation handled by the framework, before any fetch).
+    _patch_env(_write_config("all_dead"))
+    with fastapi.testclient.TestClient(app) as client:
+        for label, params in [
+            ("missing", {"n": 3}),
+            ("blank", {"uuid": "", "n": 3}),
+            ("too_long", {"uuid": "x" * 65, "n": 3}),
+        ]:
+            r = client.get("/api/find-carparks", params=params)
+            print(f"\n[G] uuid {label}")
+            check(
+                r.status_code == 422,
+                "422 when uuid missing/invalid (FastAPI)",
+                f"(status={r.status_code})",
+            )
+        # a valid uuid passes validation (with a dead config it then 503s).
+        r2 = client.get("/api/find-carparks", params={"uuid": "ok-user", "n": 3})
+        print("\n[G] uuid provided")
+        check(
+            r2.status_code == 503,
+            "valid uuid accepted (not 4xx)",
+            f"(status={r2.status_code})",
+        )
 
     # ------------------------------------------------------------------ A ----
     # every sampled camera is down -> 503
