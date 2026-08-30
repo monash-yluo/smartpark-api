@@ -179,7 +179,11 @@ async def _analyze_carpark(carpark: CarPark) -> dict | None:
     except TakephotoError as exc:
         log.warning("carpark %s camera error: %s", carpark.id, exc)
         return None
-    analysis = await app.state.detector.analyze(image)
+    try:
+        analysis = await app.state.detector.analyze(image)
+    except Exception as exc:  # noqa: BLE001 - a single bad photo must not fail the whole request
+        log.warning("carpark %s analyze error: %s", carpark.id, exc)
+        return None
     return {
         "carpark_id": carpark.id,
         "name": carpark.name,
@@ -234,6 +238,22 @@ async def find_carparks(
     # 并发拉取并推理所有被采样车场.
     results = await asyncio.gather(*(_analyze_carpark(cp) for cp in chosen))
     ok = [r for r in results if r is not None]
+    # If every sampled car park failed (camera down / inference error), we cannot
+    # produce any results. Return 503 instead of pretending there are simply no
+    # free spaces (which would be misleading to callers).
+    # 如果所有被采样车场都失败(摄像头宕机/推理错误),我们无法产生任何结果.
+    # 此时返回 503,而不是假装"车场恰好没有空位"(那会误导调用方).
+    if not ok:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "uuid": raw_uuid,
+                "status": "error",
+                "msg": "all sampled car parks are unavailable",
+                "sampled_carparks": len(chosen),
+                "results": [],
+            },
+        )
     ok.sort(key=lambda r: r["available_spaces"], reverse=True)
     top = ok[:eff_n]
 
@@ -245,6 +265,7 @@ async def find_carparks(
         "speed_inference": f"{elapsed_ms:.0f} ms",
         "requested_n": eff_n,
         "sampled_carparks": len(chosen),
+        "failed_carparks": len(chosen) - len(ok),
         "results": top,
     }
     app.state.cache.set(cache_key, payload)
