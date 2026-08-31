@@ -294,6 +294,8 @@ async def annotate_carpark(
     # 中间件得到的稳定 id(user:<uuid>,否则 ip:<client-ip>).
     user_id = request.state.user_id
     carpark = app.state.config.carpark_by_id(carpark_id)
+
+    # 如果没有找到对应的车场,返回 404 错误
     if carpark is None:
         return JSONResponse(
             status_code=404,
@@ -303,19 +305,45 @@ async def annotate_carpark(
                 "msg": f"unknown carpark_id {carpark_id}",
             },
         )
+
+    # Once the car park exists this is a valid CORE-API-2 call. Record it BEFORE
+    # the work so even a failed fetch/analysis still counts the user as active
+    # for OPS-API-2 (distinct users in last 30s).
+    # 车场存在后即为一次有效的 CORE-API-2 调用.在处理前记录,这样即使拉图/分析失败,
+    # 该用户仍会计入 OPS-API-2(最近 30 秒不同用户数).
+    log_request(time.time(), user_id, "annotate-carpark")
+
     try:
         image = await fetch_image(
             app.state.http, carpark, app.state.config.takephoto_timeout_s
         )
     except TakephotoError as exc:
+        # 如果摄像头服务返回不可用的响应,记录日志并返回 502 错误
+        log.warning("carpark %s camera error: %s", carpark.id, exc)
         return JSONResponse(
             status_code=502,
             content={"carpark_id": carpark_id, "status": "error", "msg": str(exc)},
         )
 
-    analysis = await app.state.detector.analyze(image)
-    b64 = base64.b64encode(analysis["annotated_png"]).decode("utf-8")
-    log_request(time.time(), user_id, "annotate-carpark")
+    # A bad/invalid image or an inference failure must not crash the request.
+    # Return a structured 502 (upstream image is unusable / cannot be analysed)
+    # and log it, matching the resilience pattern in _analyze_carpark.
+    # 图片无效或推理失败不能拖垮整个请求.返回结构化的 502(上游图片不可用/无法分析)
+    # 并记录日志,与 _analyze_carpark 的韧性模式一致.
+    try:
+        analysis = await app.state.detector.analyze(image)
+        b64 = base64.b64encode(analysis["annotated_png"]).decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 - a single bad photo must not fail the whole request
+        # 如果标注失败,返回 502 错误
+        log.warning("carpark %s annotate error: %s", carpark.id, exc)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "carpark_id": carpark_id,
+                "status": "error",
+                "msg": "image analysis failed",
+            },
+        )
 
     return {
         "carpark_id": carpark_id,
