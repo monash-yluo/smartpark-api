@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import logging
 import os
 import random
 import time
@@ -52,8 +51,6 @@ from .logging_utils import (
     resolve_uuid,
 )
 from .takephoto import TakephotoError, fetch_image
-
-log = logging.getLogger("smartpark.api")
 
 
 # ---------------------------------------------------------------------------
