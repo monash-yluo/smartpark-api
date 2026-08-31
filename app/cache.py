@@ -1,17 +1,15 @@
 """Small thread-safe in-memory TTL cache.
 一个小型,线程安全的内存 TTL 缓存.
 
-"Performance optimisation: repeated requests from the same user can be cached."
-"性能优化:同一用户的重复请求可以被缓存."
+"Performance optimisation: complete analyses are cached by car park ID."
+"性能优化:完整推理结果按停车场 ID 缓存."
 
-The most natural cache key is (uuid, n): the same user asking for the same n car
-parks within the TTL window gets the previous answer instantly, without re-hitting
-all the cameras or re-running inference. This is a per-pod cache, which is fine for
-the "same user repeats" optimisation; the handoff notes the multi-replica caveat
-for the user-count OPS-API-2 (see logging_utils), which is a different concern.
-最自然的缓存键是 (uuid, n):同一用户在 TTL 窗口内请求相同的 n 个车场,会立刻拿到上次的结果,
-无需重新访问所有摄像头或重跑推理.这是一个按 Pod 的缓存,对"同一用户重复"的优化足够;
-handoff 指出用户计数 OPS-API-2 有多副本的注意事项(见 logging_utils),那是另一个问题.
+The application stores the successful inference output (counts, confidence, and
+annotated PNG) under a namespaced car-park key. This per-pod cache allows the list,
+annotation, and operations endpoints to share one fetched image and one model run
+within the TTL window.
+应用将成功的推理输出(计数,置信度和标注 PNG)存储在带命名空间的停车场键下.这个按 Pod
+的缓存使列表,标注和运营端点能在 TTL 内共享一次拉图和模型推理.
 """
 
 from __future__ import annotations

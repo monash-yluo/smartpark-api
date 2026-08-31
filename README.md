@@ -28,7 +28,7 @@ OPS-REQ-2 (operational dashboard) is intentionally deferred to a later step.
     │  ├─ config.py        # load car parks from carparks.json (single source of truth)
     │  ├─ takephoto.py     # async HTTP client for the camera service
     │  ├─ inference.py     # YOLO wrapper (runtime-loaded model, thread-pool async)
-    │  ├─ cache.py         # per-user TTL cache for repeated requests
+   │  ├─ cache.py         # per-car-park TTL cache for inference results
     │  └─ logging_utils.py # structured logging + uuid context + request log
     ├─ config/carparks.json  # car park list (generated; becomes a GKE ConfigMap)
     ├─ scripts/make_carparks.py  # regenerate carparks.json
@@ -53,7 +53,7 @@ MODEL_PATH to the model.pt / model.onnx file.
 - MODEL_PATH       path to the model weights      (default /models/model.pt)
 - TAKEPHOTO_TIMEOUT  seconds for camera calls     (default 10)
 - INFERENCE_WORKERS  YOLO thread-pool size        (default 4)
-- REQUEST_CACHE_TTL  per-user cache TTL seconds   (default 30)
+- REQUEST_CACHE_TTL  per-car-park analysis cache TTL seconds   (default 30)
 - PORT             listen port                    (default 8000)
 
 ## Key design decisions (worth explaining in the interview)
@@ -69,7 +69,8 @@ MODEL_PATH to the model.pt / model.onnx file.
    it (see app/inference.py). This is the core "bottleneck + mitigation" point.
 4. 2n sampling + concurrency. find-carparks samples 2*n car parks and pulls +
    infers them concurrently (asyncio.gather), then returns the top n by free spaces.
-5. Per-user cache. Repeated (uuid, n) requests within the TTL are served from cache.
+5. Per-car-park inference cache. A successful analysis (counts, confidence, and
+   annotated image) is cached by car-park ID for the TTL, so all endpoints reuse it.
 6. Large n (what-if). n is clamped to the number of car parks, and at most 2*n are
    sampled, so a huge n (e.g. 200) cannot be abused to hit the cameras/replicas.
 7. Known caveat. OPS-API-2 counts from an in-memory request log, so it is per-pod.

@@ -159,16 +159,27 @@ def healthz():
 # ---------------------------------------------------------------------------
 # Helpers  辅助函数
 # ---------------------------------------------------------------------------
-async def _analyze_carpark(carpark: CarPark) -> dict | None:
-    """Pull one image from a car park camera and run inference.
+async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
+    """Return a cached analysis, or pull one camera image and run inference.
     从某个车场摄像头拉取一张图片并运行推理.
 
-    Returns a result dict, or None if that car park's camera failed (so one bad
-    camera never fails the whole /find-carparks request). Overlaps I/O (image
-    fetch) with CPU (YOLO) because these tasks run concurrently under gather().
+    Successful analyses are cached by car park ID, so every endpoint can reuse
+    the same count, confidence, and annotated image during the TTL window.
+    成功的分析结果按停车场 ID 缓存,因此所有端点都能在 TTL 内复用同一份计数,
+    置信度和标注图.
+
+    Returns a full analysis dict, or None if that car park's camera or inference
+    failed (so one bad camera never fails the whole /find-carparks request).
+    Overlaps I/O (image fetch) with CPU (YOLO) because these tasks run
+    concurrently under gather().
     返回结果字典;如果该车场摄像头失败则返回 None(这样单个摄像头故障不会让整个
     /find-carparks 请求失败).由于这些任务在 gather() 下并发运行,I/O(拉图)与 CPU(YOLO)重叠.
     """
+    cache_key = ("carpark-analysis", carpark.id)
+    cached = app.state.cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         image = await fetch_image(
             app.state.http, carpark, app.state.config.takephoto_timeout_s
@@ -180,6 +191,15 @@ async def _analyze_carpark(carpark: CarPark) -> dict | None:
         analysis = await app.state.detector.analyze(image)
     except Exception as exc:  # noqa: BLE001 - a single bad photo must not fail the whole request
         log.warning("carpark %s analyze error: %s", carpark.id, exc)
+        return None
+    app.state.cache.set(cache_key, analysis)
+    return analysis
+
+
+async def _analyze_carpark(carpark: CarPark) -> dict | None:
+    """Build a CORE-API car-park summary from a cached full analysis."""
+    analysis = await _get_carpark_analysis(carpark)
+    if analysis is None:
         return None
     return {
         "carpark_id": carpark.id,
@@ -229,14 +249,6 @@ async def find_carparks(
     sample_n = min(2 * eff_n, len(carparks))
     chosen = random.sample(carparks, sample_n)
 
-    # Repeated requests from the same user can be cached (per-pod).
-    # 同一用户的重复请求可以被缓存(按 Pod).
-    cache_key = (user_id, eff_n)
-    cached = app.state.cache.get(cache_key)
-    if cached is not None:
-        cached["msg"] = "success (cached)"
-        return cached
-
     start = time.perf_counter()
     # Pull + infer all sampled car parks concurrently.
     # 并发拉取并推理所有被采样车场.
@@ -272,7 +284,6 @@ async def find_carparks(
         "failed_carparks": len(chosen) - len(ok),
         "results": top,
     }
-    app.state.cache.set(cache_key, payload)
     log_request(time.time(), user_id, "find-carparks")
     return payload
 
@@ -310,29 +321,8 @@ async def annotate_carpark(
     # 该用户仍会计入 OPS-API-2(最近 30 秒不同用户数).
     log_request(time.time(), user_id, "annotate-carpark")
 
-    try:
-        image = await fetch_image(
-            app.state.http, carpark, app.state.config.takephoto_timeout_s
-        )
-    except TakephotoError as exc:
-        # 如果摄像头服务返回不可用的响应,记录日志并返回 502 错误
-        log.warning("carpark %s camera error: %s", carpark.id, exc)
-        return JSONResponse(
-            status_code=502,
-            content={"carpark_id": carpark_id, "status": "error", "msg": str(exc)},
-        )
-
-    # A bad/invalid image or an inference failure must not crash the request.
-    # Return a structured 502 (upstream image is unusable / cannot be analysed)
-    # and log it, matching the resilience pattern in _analyze_carpark.
-    # 图片无效或推理失败不能拖垮整个请求.返回结构化的 502(上游图片不可用/无法分析)
-    # 并记录日志,与 _analyze_carpark 的韧性模式一致.
-    try:
-        analysis = await app.state.detector.analyze(image)
-        b64 = base64.b64encode(analysis["annotated_png"]).decode("utf-8")
-    except Exception as exc:  # noqa: BLE001 - a single bad photo must not fail the whole request
-        # 如果标注失败,返回 502 错误
-        log.warning("carpark %s annotate error: %s", carpark.id, exc)
+    analysis = await _get_carpark_analysis(carpark)
+    if analysis is None:
         return JSONResponse(
             status_code=502,
             content={
@@ -341,6 +331,7 @@ async def annotate_carpark(
                 "msg": "image analysis failed",
             },
         )
+    b64 = base64.b64encode(analysis["annotated_png"]).decode("utf-8")
 
     return {
         "carpark_id": carpark_id,
