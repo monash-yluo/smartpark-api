@@ -53,12 +53,28 @@ from .logging_utils import (
 from .takephoto import TakephotoError, fetch_image
 
 
+async def _shutdown_inflight_analyses(app: FastAPI) -> None:
+    """优雅停止所有正在进行的车场图片分析任务。 / Gracefully stop all in-flight carpark image analysis tasks."""
+    async with app.state.inflight_analyses_lock:
+        # 获取所有正在进行的分析任务并清空字典,以便在应用关闭时不再接受新任务. / Get all in-flight analysis tasks and clear the dictionary so that no new tasks are accepted when the app is shutting down.
+        tasks = list(app.state.inflight_analyses.values())
+        app.state.inflight_analyses.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    # 等待所有正在关闭的分析 Task 都真正结束 / Wait for all shutting down analysis tasks to actually finish
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan: load config, model, cache, HTTP client once at startup
 # 生命周期:启动时一次性加载配置,模型,缓存,HTTP 客户端
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """初始化应用资源，并在服务退出时按顺序清理共享任务和 HTTP 客户端。 / Initialize application resources and clean up shared tasks and HTTP client in order on service exit."""
     # 加载本地config
     config = load_platform_config()
     app.state.config = config
@@ -81,8 +97,14 @@ async def lifespan(app: FastAPI):
         config.model_path,
         config.request_cache_ttl_s,
     )
+
     yield
-    await app.state.http.aclose()
+    
+    # 优雅关闭:取消所有正在进行的分析任务并关闭 HTTP 客户端. / Graceful shutdown: cancel all in-flight analyses and close the HTTP client. /
+    try:
+        await _shutdown_inflight_analyses(app)
+    finally:
+        await app.state.http.aclose()
 
 
 app = FastAPI(title="smartpark-api", version="1.0.0", lifespan=lifespan)
@@ -109,6 +131,7 @@ app = FastAPI(title="smartpark-api", version="1.0.0", lifespan=lifespan)
 # ---------------------------------------------------------------------------
 @app.middleware("http")
 async def uuid_context(request, call_next):
+    """为请求设置稳定的用户标识，并记录请求方法、路径、状态和耗时。 / Set a stable user identifier for the request and log the request method, path, status, and elapsed time."""
     # Resolve a stable "user id": the client uuid if provided, else the client IP
     # (so one user hitting the API multiple times groups to one id, not many).
     # 解析一个稳定的"用户 id":优先用客户端 uuid,否则用客户端 IP
@@ -144,6 +167,7 @@ async def uuid_context(request, call_next):
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
+    """返回服务名称、运行状态和当前已加载的车场数量。 / Return the service name, running status, and the number of currently loaded carparks."""
     return {
         "service": "smartpark-api",
         "status": "ok",
@@ -154,7 +178,7 @@ def root():
 @app.get("/healthz")
 def healthz():
     """Liveness/readiness probe for GKE.
-    GKE 的存活/就绪探针."""
+    GKE 的存活/就绪探针。"""
     return {"status": "ok"}
 
 
@@ -162,7 +186,7 @@ def healthz():
 # Helpers  辅助函数
 # ---------------------------------------------------------------------------
 async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
-    """Pull one camera image, run inference, and cache a successful result."""
+    """获取一个车场的摄像头图片，执行推理，并缓存成功的分析结果。 / Fetch an image from a carpark's camera, perform inference, and cache the successful analysis results."""
     cache_key = ("carpark-analysis", carpark.id)
 
     try:
@@ -184,7 +208,9 @@ async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
 
 
 async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
-    """Return a cached or in-flight analysis, starting one task when needed.
+    """返回缓存中或正在执行的分析结果；必要时创建一个共享任务。
+
+    Return a cached or in-flight analysis, starting one task when needed.
     从某个车场摄像头拉取一张图片并运行推理.
 
     Successful analyses are cached by car park ID, so every endpoint can reuse
@@ -227,7 +253,7 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
 
 
 async def _analyze_carpark(carpark: CarPark) -> dict | None:
-    """Build a CORE-API car-park summary from a cached full analysis."""
+    """根据完整分析结果生成 CORE-API 使用的车场摘要。"""
     analysis = await _get_carpark_analysis(carpark)
     if analysis is None:
         return None
@@ -256,6 +282,7 @@ async def find_carparks(
     ),
     n: int = Query(default=3, ge=1, description="how many car parks to return"),
 ):
+    """随机查询车场并返回可用车位最多的前 n 个结果。"""
     # raw uuid to echo back to the client (matches the spec output format).
     # 回显给客户端的原始 uuid(对应作业输出格式).
     raw_uuid = resolve_uuid(uuid)
@@ -328,6 +355,7 @@ async def annotate_carpark(
     carpark_id: str = Query(..., description="car park id, e.g. CBD_001"),
     uuid: str | None = Query(default=None, description="optional user uuid"),
 ):
+    """获取指定车场的分析结果，并返回其 Base64 编码的标注图片。"""
     # middleware-derived stable id (user:<uuid>, else ip:<client-ip>).
     # 中间件得到的稳定 id(user:<uuid>,否则 ip:<client-ip>).
     user_id = request.state.user_id
@@ -379,6 +407,7 @@ async def annotate_carpark(
 # ---------------------------------------------------------------------------
 @app.get("/api/ops/carparks")
 async def ops_carparks():
+    """查询所有已配置车场，并返回各车场当前的可用车位数。"""
     carparks = list(app.state.config.carparks)
     # Note: running inference on every car park is heavy; acceptable for an
     # operator endpoint. A short per-car park cache could be added.
@@ -394,6 +423,7 @@ async def ops_carparks():
 # ---------------------------------------------------------------------------
 @app.get("/api/ops/users")
 async def ops_users():
+    """统计最近 30 秒访问过有效 API 的不同用户数量。"""
     return {
         "status": "success",
         "users_last_30s": count_unique_users(30.0),

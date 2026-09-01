@@ -115,7 +115,12 @@ def _patch_env(config_path):
 
 def run():
     import fastapi.testclient  # noqa: F401
-    from app.main import app, _analyze_carpark, _get_carpark_analysis
+    from app.main import (
+        _analyze_carpark,
+        _get_carpark_analysis,
+        _shutdown_inflight_analyses,
+        app,
+    )
     from app.config import CarPark
 
     passed = 0
@@ -318,6 +323,43 @@ def run():
         and not app.state.inflight_analyses,
         "cancelled waiter leaves shared task alive; result reaches waiter and cache",
         f"(inferences={blocking_detector.calls})",
+    )
+
+    # Shutdown cancels in-flight work and waits for it before the HTTP client
+    # is closed, so the task cannot continue using a shutdown resource.
+    shutdown_events = []
+
+    async def _shutdown_probe():
+        analysis_started = asyncio.Event()
+
+        async def pending_analysis():
+            try:
+                analysis_started.set()
+                await asyncio.Event().wait()
+            finally:
+                shutdown_events.append("task-finished")
+
+        class _ShutdownHttp:
+            async def aclose(self):
+                shutdown_events.append("http-closed")
+                assert "task-finished" in shutdown_events
+
+        pending_task = asyncio.create_task(pending_analysis())
+        app.state.inflight_analyses = {cp.id: pending_task}
+        app.state.http = _ShutdownHttp()
+        await analysis_started.wait()
+        await _shutdown_inflight_analyses(app)
+        await app.state.http.aclose()
+        return pending_task
+
+    shutdown_task = asyncio.run(_shutdown_probe())
+    print("\n[shutdown] in-flight analysis tasks are cancelled before HTTP close")
+    check(
+        shutdown_task.cancelled()
+        and shutdown_events == ["task-finished", "http-closed"]
+        and not app.state.inflight_analyses,
+        "shutdown awaits cancelled analysis before closing HTTP client",
+        f"(events={shutdown_events})",
     )
 
     # ------------------------------------------------------------------ E ----
