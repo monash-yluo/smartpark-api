@@ -175,11 +175,13 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
     返回结果字典;如果该车场摄像头失败则返回 None(这样单个摄像头故障不会让整个
     /find-carparks 请求失败).由于这些任务在 gather() 下并发运行,I/O(拉图)与 CPU(YOLO)重叠.
     """
+    # 以停车场 ID 缓存完整分析结果，供多个接口在 TTL 内复用。 / Cache the full analysis by car park ID for reuse by multiple endpoints during the TTL.
     cache_key = ("carpark-analysis", carpark.id)
     cached = app.state.cache.get(cache_key)
     if cached is not None:
         return cached
 
+    # 从 takephoto 服务获取当前摄像头图片；单个停车场失败不影响整体请求。 / Fetch the current camera image from the takephoto service; a single car park failure does not affect the overall request.
     try:
         image = await fetch_image(
             app.state.http, carpark, app.state.config.takephoto_timeout_s
@@ -187,11 +189,15 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
     except TakephotoError as exc:
         log.warning("carpark %s camera error: %s", carpark.id, exc)
         return None
+
+    # 对图片执行停车位检测；推理异常同样降级为该停车场不可用。 / Run parking space detection on the image; inference exceptions also degrade to that car park being unavailable.
     try:
         analysis = await app.state.detector.analyze(image)
     except Exception as exc:  # noqa: BLE001 - a single bad photo must not fail the whole request
         log.warning("carpark %s analyze error: %s", carpark.id, exc)
         return None
+
+    # 仅缓存成功的推理结果，避免暂时性失败在 TTL 内被放大。
     app.state.cache.set(cache_key, analysis)
     return analysis
 
