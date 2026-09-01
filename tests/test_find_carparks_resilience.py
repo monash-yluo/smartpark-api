@@ -268,6 +268,58 @@ def run():
         f"(fetches={counting_http.calls}, inferences={counting_detector.calls})",
     )
 
+    # A cancelled waiter must not cancel the shared fetch/inference task. The
+    # remaining waiter should receive the result, and the successful result
+    # should still be written to the cache.
+    cancellation_started = asyncio.Event()
+    cancellation_release = asyncio.Event()
+
+    class _BlockingDetector:
+        def __init__(self):
+            self.calls = 0
+
+        async def analyze(self, image_bytes):
+            self.calls += 1
+            cancellation_started.set()
+            await cancellation_release.wait()
+            return {
+                "available_spaces": 11,
+                "occupied_spaces": 1,
+                "confidence_score": 0.95,
+                "annotated_png": image_bytes,
+            }
+
+    blocking_detector = _BlockingDetector()
+    app.state.cache.clear()
+    app.state.http = _CountingHttp()
+    app.state.detector = blocking_detector
+
+    async def _cancelled_waiter_analysis():
+        cancelled_waiter = asyncio.create_task(_get_carpark_analysis(cp))
+        await cancellation_started.wait()
+        remaining_waiter = asyncio.create_task(_get_carpark_analysis(cp))
+        cancelled_waiter.cancel()
+        try:
+            await cancelled_waiter
+        except asyncio.CancelledError:
+            pass
+        cancellation_release.set()
+        remaining_result = await remaining_waiter
+        cached_result = await _get_carpark_analysis(cp)
+        return remaining_result, cached_result
+
+    remaining_result, cached_result = asyncio.run(_cancelled_waiter_analysis())
+    print("\n[cancellation] cancelled waiter does not cancel shared analysis")
+    check(
+        blocking_detector.calls == 1
+        and remaining_result is not None
+        and cached_result == remaining_result
+        and app.state.cache.get(("carpark-analysis", cp.id)) == remaining_result
+        and not app.state.inflight_analyses,
+        "cancelled waiter leaves shared task alive; result reaches waiter and cache",
+        f"(inferences={blocking_detector.calls})",
+    )
+
     # ------------------------------------------------------------------ E ----
     # every inference raises (fetch succeeds) -> 503
     _patch_env(_write_config("all_ok", "http://mock"))
