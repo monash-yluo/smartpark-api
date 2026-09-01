@@ -115,7 +115,7 @@ def _patch_env(config_path):
 
 def run():
     import fastapi.testclient  # noqa: F401
-    from app.main import app, _analyze_carpark
+    from app.main import app, _analyze_carpark, _get_carpark_analysis
     from app.config import CarPark
 
     passed = 0
@@ -199,6 +199,74 @@ def run():
     result = asyncio.run(_analyze_carpark(cp))
     print("\n[D] single inference raises (unit)")
     check(result is None, "_analyze_carpark returns None", f"(got={result})")
+
+    # --------------------------------------------------------- single-flight ----
+    # Concurrent cache misses share one detector call per car park. The counting
+    # detector stands in for YOLO here: its analyze() method is the exact call
+    # made by the production YOLO wrapper.
+    class _CountingHttp:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, url, params=None, timeout=None):
+            self.calls += 1
+            await asyncio.sleep(0.01)
+            return _FakeResp()
+
+    class _CountingDetector:
+        def __init__(self):
+            self.calls = 0
+
+        async def analyze(self, image_bytes):
+            self.calls += 1
+            await asyncio.sleep(0.01)
+            return {
+                "available_spaces": 7,
+                "occupied_spaces": 3,
+                "confidence_score": 0.9,
+                "annotated_png": image_bytes,
+            }
+
+    counting_http = _CountingHttp()
+    counting_detector = _CountingDetector()
+    app.state.cache.clear()
+    app.state.http = counting_http
+    app.state.detector = counting_detector
+
+    second_cp = CarPark(id="X_002", name="X 002", takephoto_url="http://mock")
+
+    async def _single_flight_analysis():
+        concurrent_analyses = await asyncio.gather(
+            _get_carpark_analysis(cp),
+            _get_carpark_analysis(cp),
+            _get_carpark_analysis(second_cp),
+            _get_carpark_analysis(second_cp),
+        )
+        calls_after_concurrency = (
+            counting_http.calls,
+            counting_detector.calls,
+        )
+        cached_analyses = await asyncio.gather(
+            _get_carpark_analysis(cp), _get_carpark_analysis(second_cp)
+        )
+        return concurrent_analyses, cached_analyses, calls_after_concurrency
+
+    analyses, cached_analyses, calls_after_concurrency = asyncio.run(
+        _single_flight_analysis()
+    )
+    print("\n[single-flight] concurrent analysis and cache reuse")
+    check(
+        calls_after_concurrency == (2, 2)
+        and counting_http.calls == 2
+        and counting_detector.calls == 2
+        and analyses[0] == analyses[1]
+        and analyses[2] == analyses[3]
+        and cached_analyses[0] == analyses[0]
+        and cached_analyses[1] == analyses[2]
+        and not app.state.inflight_analyses,
+        "one fetch and YOLO-style inference task per car park; later calls use cache",
+        f"(fetches={counting_http.calls}, inferences={counting_detector.calls})",
+    )
 
     # ------------------------------------------------------------------ E ----
     # every inference raises (fetch succeeds) -> 503

@@ -63,6 +63,8 @@ async def lifespan(app: FastAPI):
     config = load_platform_config()
     app.state.config = config
     app.state.cache = TTLCache(default_ttl=config.request_cache_ttl_s)
+    app.state.inflight_analyses = {}
+    app.state.inflight_analyses_lock = asyncio.Lock()
     # The model is loaded from disk at runtime (MODEL_PATH). If it is not
     # available (e.g. local dev), build_detector returns a MockDetector so the
     # endpoints still boot and can be tested. On GKE, MODEL_PATH is a mounted PVC.
@@ -159,8 +161,30 @@ def healthz():
 # ---------------------------------------------------------------------------
 # Helpers  辅助函数
 # ---------------------------------------------------------------------------
+async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
+    """Pull one camera image, run inference, and cache a successful result."""
+    cache_key = ("carpark-analysis", carpark.id)
+
+    try:
+        image = await fetch_image(
+            app.state.http, carpark, app.state.config.takephoto_timeout_s
+        )
+    except TakephotoError as exc:
+        log.warning("carpark %s camera error: %s", carpark.id, exc)
+        return None
+
+    try:
+        analysis = await app.state.detector.analyze(image)
+    except Exception as exc:  # noqa: BLE001 - a single bad photo must not fail the whole request
+        log.warning("carpark %s analyze error: %s", carpark.id, exc)
+        return None
+
+    app.state.cache.set(cache_key, analysis)
+    return analysis
+
+
 async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
-    """Return a cached analysis, or pull one camera image and run inference.
+    """Return a cached or in-flight analysis, starting one task when needed.
     从某个车场摄像头拉取一张图片并运行推理.
 
     Successful analyses are cached by car park ID, so every endpoint can reuse
@@ -181,25 +205,25 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
     if cached is not None:
         return cached
 
-    # 从 takephoto 服务获取当前摄像头图片；单个停车场失败不影响整体请求。 / Fetch the current camera image from the takephoto service; a single car park failure does not affect the overall request.
-    try:
-        image = await fetch_image(
-            app.state.http, carpark, app.state.config.takephoto_timeout_s
-        )
-    except TakephotoError as exc:
-        log.warning("carpark %s camera error: %s", carpark.id, exc)
-        return None
+    async with app.state.inflight_analyses_lock:
+        # 等待锁时,另一个请求可能已经完成分析并写入缓存. / Another request may have completed the analysis while this request was waiting for the lock.
+        cached = app.state.cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-    # 对图片执行停车位检测；推理异常同样降级为该停车场不可用。 / Run parking space detection on the image; inference exceptions also degrade to that car park being unavailable.
-    try:
-        analysis = await app.state.detector.analyze(image)
-    except Exception as exc:  # noqa: BLE001 - a single bad photo must not fail the whole request
-        log.warning("carpark %s analyze error: %s", carpark.id, exc)
-        return None
+        task = app.state.inflight_analyses.get(carpark.id)
+        if task is None:
+            task = asyncio.create_task(_load_and_cache_carpark_analysis(carpark))
+            app.state.inflight_analyses[carpark.id] = task
 
-    # 仅缓存成功的推理结果，避免暂时性失败在 TTL 内被放大。
-    app.state.cache.set(cache_key, analysis)
-    return analysis
+            def remove_completed_task(completed_task: asyncio.Task) -> None:
+                if app.state.inflight_analyses.get(carpark.id) is completed_task:
+                    del app.state.inflight_analyses[carpark.id]
+
+            task.add_done_callback(remove_completed_task)
+
+    # 已取消的 HTTP 请求不能取消共享的拉图/推理任务. / A cancelled HTTP request must not cancel the shared camera/inference task.
+    return await asyncio.shield(task)
 
 
 async def _analyze_carpark(carpark: CarPark) -> dict | None:
