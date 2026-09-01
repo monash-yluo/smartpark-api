@@ -273,6 +273,64 @@ def run():
         f"(fetches={counting_http.calls}, inferences={counting_detector.calls})",
     )
 
+    # A valid cache entry in the refresh window returns immediately while a
+    # single background task refreshes it for subsequent requests.
+    refresh_started = asyncio.Event()
+    refresh_release = asyncio.Event()
+    old_analysis = {
+        "available_spaces": 4,
+        "occupied_spaces": 6,
+        "confidence_score": 0.8,
+        "annotated_png": b"old",
+    }
+    refreshed_analysis = {
+        "available_spaces": 9,
+        "occupied_spaces": 1,
+        "confidence_score": 0.95,
+        "annotated_png": b"new",
+    }
+
+    class _RefreshDetector:
+        def __init__(self):
+            self.calls = 0
+
+        async def analyze(self, image_bytes):
+            self.calls += 1
+            refresh_started.set()
+            await refresh_release.wait()
+            return refreshed_analysis
+
+    refresh_detector = _RefreshDetector()
+    refresh_cache_key = ("carpark-analysis", cp.id)
+    app.state.cache.clear()
+    app.state.cache.set(refresh_cache_key, old_analysis)
+    created_at, expires_at, value = app.state.cache._data[refresh_cache_key]
+    app.state.cache._data[refresh_cache_key] = (created_at - 21, expires_at, value)
+    app.state.http = _CountingHttp()
+    app.state.detector = refresh_detector
+
+    async def _refresh_ahead_analysis():
+        immediate_results = await asyncio.gather(
+            _get_carpark_analysis(cp), _get_carpark_analysis(cp)
+        )
+        await refresh_started.wait()
+        refresh_task = app.state.inflight_analyses[cp.id]
+        refresh_release.set()
+        await asyncio.shield(refresh_task)
+        return immediate_results, await _get_carpark_analysis(cp)
+
+    immediate_results, refreshed_result = asyncio.run(_refresh_ahead_analysis())
+    print("\n[refresh-ahead] valid cache returns while one task refreshes it")
+    check(
+        immediate_results == [old_analysis, old_analysis]
+        and refresh_detector.calls == 1
+        and refreshed_result == refreshed_analysis
+        and app.state.cache.get(refresh_cache_key) == refreshed_analysis
+        and not app.state.inflight_analyses,
+        "cached result returns immediately; one background task updates the cache",
+        f"(inferences={refresh_detector.calls})",
+    )
+
     # A cancelled waiter must not cancel the shared fetch/inference task. The
     # remaining waiter should receive the result, and the successful result
     # should still be written to the cache.

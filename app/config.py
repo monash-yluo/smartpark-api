@@ -57,6 +57,7 @@ class PlatformConfig:
     takephoto_timeout_s: float = 10.0
     inference_workers: int = 4
     request_cache_ttl_s: int = 30
+    request_cache_refresh_after_s: int = 20
 
     def carpark_by_id(self, carpark_id: str) -> CarPark | None:
         # Look up a single car park by its id. 按 id 查找单个车场.
@@ -102,10 +103,21 @@ def load_platform_config() -> PlatformConfig:
 
     model_path = Path(os.getenv("MODEL_PATH", "/models/model.pt")).resolve()
 
+    request_cache_ttl_s = int(os.getenv("REQUEST_CACHE_TTL", "30"))
+    request_cache_refresh_after_s = int(
+        os.getenv("REQUEST_CACHE_REFRESH_AFTER", "20")
+    )
+    if not 0 < request_cache_refresh_after_s < request_cache_ttl_s:
+        raise ValueError(
+            "REQUEST_CACHE_REFRESH_AFTER must be greater than 0 and less than "
+            "REQUEST_CACHE_TTL"
+        )
+
     return PlatformConfig(
         carparks=carparks,
         model_path=model_path,
         takephoto_timeout_s=float(os.getenv("TAKEPHOTO_TIMEOUT", "10")),
         inference_workers=max(1, int(os.getenv("INFERENCE_WORKERS", "4"))),
-        request_cache_ttl_s=int(os.getenv("REQUEST_CACHE_TTL", "30")),
+        request_cache_ttl_s=request_cache_ttl_s,
+        request_cache_refresh_after_s=request_cache_refresh_after_s,
     )

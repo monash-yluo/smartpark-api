@@ -91,11 +91,12 @@ async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient(timeout=config.takephoto_timeout_s)
 
     log.info(
-        "started | carparks=%d | inference_workers=%d | model=%s | cache_ttl=%ds",
+        "started | carparks=%d | inference_workers=%d | model=%s | cache_ttl=%ds | cache_refresh_after=%ds",
         len(config.carparks),
         config.inference_workers,
         config.model_path,
         config.request_cache_ttl_s,
+        config.request_cache_refresh_after_s,
     )
 
     yield
@@ -207,6 +208,23 @@ async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
     return analysis
 
 
+async def _get_or_start_analysis_task(carpark: CarPark) -> asyncio.Task:
+    """返回指定车场正在运行的共享任务；没有时创建并登记一个任务。"""
+    async with app.state.inflight_analyses_lock:
+        task = app.state.inflight_analyses.get(carpark.id)
+        if task is None:
+            task = asyncio.create_task(_load_and_cache_carpark_analysis(carpark))
+            app.state.inflight_analyses[carpark.id] = task
+
+            def remove_completed_task(completed_task: asyncio.Task) -> None:
+                if app.state.inflight_analyses.get(carpark.id) is completed_task:
+                    del app.state.inflight_analyses[carpark.id]
+
+            task.add_done_callback(remove_completed_task)
+
+    return task
+
+
 async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
     """返回缓存中或正在执行的分析结果；必要时创建一个共享任务。
 
@@ -227,9 +245,14 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
     """
     # 以停车场 ID 缓存完整分析结果，供多个接口在 TTL 内复用。 / Cache the full analysis by car park ID for reuse by multiple endpoints during the TTL.
     cache_key = ("carpark-analysis", carpark.id)
-    cached = app.state.cache.get(cache_key)
+    cached = app.state.cache.get_with_refresh(
+        cache_key, app.state.config.request_cache_refresh_after_s
+    )
     if cached is not None:
-        return cached
+        if cached.should_refresh:
+            # 缓存仍在严格 TTL 内：当前请求直接使用它；只在后台启动一个共享刷新任务。
+            await _get_or_start_analysis_task(carpark)
+        return cached.value
 
     async with app.state.inflight_analyses_lock:
         # 等待锁时,另一个请求可能已经完成分析并写入缓存. / Another request may have completed the analysis while this request was waiting for the lock.
