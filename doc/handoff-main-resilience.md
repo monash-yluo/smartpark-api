@@ -2,7 +2,7 @@
 
 > 供后续 AI 会话/开发者快速接手的交接文档。
 > 对象文件:`app/main.py`
-> 更新日期:2026-09-01
+> 更新日期:2026-09-02
 
 ## 背景
 
@@ -156,7 +156,66 @@ Task 身份,避免旧任务误删同一停车场的新任务。
 - 任务完成后再次请求两个停车场,断言调用次数不增加,证明使用完成缓存。
 - 断言 in-flight 表在任务结束后为空。
 
-`app/cache.py`、`README.md` 和本文件的缓存说明已同步为按停车场分析缓存。
+`app/cache.py` 和本文件的缓存说明已同步为按停车场分析缓存。
+
+### 7. 请求取消不会误取消共享分析 Task
+
+调用方等待共享 Task 时使用:
+
+```python
+return await asyncio.shield(task)
+```
+
+`shield()` 让 HTTP 请求取消只影响该请求自己的等待，不会向 `task` 传播取消。
+因此另一位正在等待同一车场分析的调用方仍能获得结果，成功结果也仍会写入缓存。
+
+测试使用可控的阻塞 detector 验证：取消第一个等待者后，第二个等待者继续获得结果；
+推理只运行一次，缓存成功写入，in-flight 表最终清空。
+
+### 8. 优雅停机收尾 in-flight Task
+
+服务 lifespan 退出时现在会调用 `_shutdown_inflight_analyses(app)`：
+
+1. 在 `inflight_analyses_lock` 内快照并清空已登记 Task；
+2. 对尚未完成的 Task 调用 `cancel()`；
+3. `await asyncio.gather(*tasks, return_exceptions=True)`，等待 Task 实际结束；
+4. 最后才执行 `await app.state.http.aclose()`。
+
+`task.cancel()` 只是发出取消请求，Task 要在后续可取消的 `await` 点处理
+`CancelledError` 并完成 finally 清理；因此必须 `gather()` 等待。测试验证 Task 的
+清理事件发生在 HTTP client 关闭之前。
+
+### 9. Refresh-ahead 缓存
+
+为减少 TTL 临界点的等待延迟，缓存层保留旧的严格 `TTLCache.get()` 接口，并新增:
+
+```python
+lookup = cache.get_with_refresh(key, refresh_after)
+```
+
+该方法只返回尚未过期的缓存值，并通过 `lookup.should_refresh` 标记是否已进入提前刷新
+窗口。当前默认配置为:
+
+```text
+REQUEST_CACHE_TTL=30
+REQUEST_CACHE_REFRESH_AFTER=20
+```
+
+约束为 $0 < refresh_after < TTL$。请求行为如下：
+
+| 缓存年龄 | 行为 |
+|-----------|------|
+| 0-20 秒 | 立即返回缓存，不刷新 |
+| 20-30 秒 | 立即返回缓存，同时通过 `_get_or_start_analysis_task()` 去重地启动后台刷新 |
+| 大于 30 秒 | 严格 miss；等待已有共享 Task 或创建一个并等待其结果 |
+
+后台刷新 Task 和普通 cache miss 共用 `inflight_analyses`，故同一 Pod 的同一车场最多只有
+一个拉图/推理任务；它也会被优雅停机逻辑统一取消和等待。调用 `_get_or_start_analysis_task()`
+时需要 `await`，但只等待短暂的 async lock、查找与 Task 登记，**不等待**后台拉图或推理；
+真正耗时工作由 `asyncio.create_task()` 调度。
+
+新增测试验证：刷新窗口内的两个并发调用立刻取得旧缓存，只运行一次后台推理，后台完成后
+缓存替换为新结果。
 
 ## 现在的响应语义(三级)
 
@@ -179,10 +238,16 @@ Task 身份,避免旧任务误删同一停车场的新任务。
 
 ## 待办/可优化
 
-- [ ] **优先级高:** 为 `_get_carpark_analysis` 增加专门的取消测试,验证一个等待者
-    取消后共享 Task 仍完成、写入缓存,另一个等待者仍能得到结果。
-- [ ] **优先级高:** 在 lifespan 退出时取消并 await 尚未完成的 in-flight Tasks,
-    再关闭 HTTP client,避免优雅停机时遗留后台任务。
+- [x] 为 `_get_carpark_analysis` 增加请求取消测试：等待者取消不会取消共享 Task。
+- [x] 在 lifespan 退出时取消并 await in-flight Task，再关闭 HTTP client。
+- [x] 加入 refresh-ahead：20 秒后后台刷新、30 秒严格 TTL 失效。
+- [ ] **优先级高:** 为关闭期间阻止新 Task 创建增加 `app.state.shutting_down` 状态。
+    当前 shutdown 清空 in-flight 表后，理论上仍可能有一个已在运行的请求随后进入
+    `_get_or_start_analysis_task()` 并创建新 Task；该 Task 不在 shutdown 快照中，可能与
+    已关闭的 HTTP client 竞争。应在 lifespan 退出开始时置位，在创建 Task 前检查并拒绝新任务。
+- [ ] **优先级中:** 给 refresh-ahead 加入失败后的重试节流/退避。当前刷新失败不会覆盖旧缓存，
+    这是正确的；但在 20-30 秒窗口内，每次后续命中都可能再次触发一次刷新，故障相机可能产生
+    额外请求。
 - [ ] **优先级中:** 若需要跨副本去重,使用 Redis 等共享组件实现分布式锁/结果缓存;
     当前 `asyncio.Lock` 只在单个进程内有效。
 - [ ] **优先级中:** 给按停车场缓存增加容量上限或定期清理策略。当前 TTLCache 只在
@@ -191,9 +256,13 @@ Task 身份,避免旧任务误删同一停车场的新任务。
     可每次拉图后按图片哈希缓存推理结果,但这样不能省掉相机请求。
 - [ ] **优先级低:** 可以给缓存命中/未命中、single-flight 等待、推理耗时增加指标,
     便于 Locust 和 GKE 压测判断优化是否有效。
+- [ ] **优先级低:** `TTLCache` 使用 `time.time()` 计算年龄，系统时间回拨或跳跃可能使
+    TTL/刷新窗口不准确；若需要更稳健的本地计时，可改为 `time.monotonic()`。
 - [ ] `ops_carparks` 是否在全部停车场失败时返回 503 仍需按作业语义决定;当前保持原行为。
 - [ ] 单个车场的拉图或推理失败时不会写入按停车场 ID 的分析缓存,
     因此之后的请求会重试;这是避免缓存暂时性故障的预期行为。
+- [ ] 文档同步：`README.md` 的环境变量列表尚未列出
+    `REQUEST_CACHE_REFRESH_AFTER`，应补上默认值 `20` 与约束。
 
 ## 验证
 
@@ -205,8 +274,9 @@ Task 身份,避免旧任务误删同一停车场的新任务。
 .venv\Scripts\python.exe tests\test_find_carparks_resilience.py
 ```
 
-最终结果:**10/10 passed**。测试覆盖 UUID 校验、全部相机失败、单个/全部推理失败、
-部分失败、全成功、同一停车场 single-flight、不同停车场并发隔离和后续缓存复用。
+最终结果:**13/13 passed**。测试覆盖 UUID 校验、全部相机失败、单个/全部推理失败、
+部分失败、全成功、同一停车场 single-flight、不同停车场并发隔离、缓存复用、请求取消、
+优雅停机以及 refresh-ahead 后台刷新。
 
 ## 需要用到的上下文(其他 AI 会话)
 
