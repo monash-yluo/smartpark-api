@@ -19,14 +19,8 @@ We solve this with two pieces:
      并存入 ContextVar.日志 formatter 在每条记录上读取该 ContextVar,
      因此请求处理期间发出的所有日志都会自动带上正确的 uuid.
 
-OPS-REQ-1 / OPS-API-2: we also keep a bounded, in-memory ring of recent core-API
-usage so OPS-API-2 can report the number of distinct users in the last 30 seconds.
-NOTE: this is per-pod state. Across multiple replicas each pod only sees its own
-share of traffic, so OPS-API-2 under-counts cluster-wide. See README.
-OPS-REQ-1 / OPS-API-2:我们还维护一个有界的,内存中的最近核心 API 使用环形记录,
-使 OPS-API-2 能报告最近 30 秒内的不同用户数.
-注意:这是每个 Pod 的状态.在多副本下,每个 Pod 只看到自己那份流量,
-因此 OPS-API-2 会在集群范围内少计.详见 README.
+OPS-REQ-1 is provided by the structured application logs emitted below.
+OPS-REQ-1 由下方输出的结构化应用日志实现.
 """
 
 from __future__ import annotations
@@ -71,13 +65,6 @@ SERVICE_NAME = "smartpark-api"
 current_uuid: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_uuid", default="-"
 )
-
-# A bounded in-memory list of recent core-API requests for OPS-API-2.
-# 一个有界的,内存中的最近核心 API 请求列表,供 OPS-API-2 使用.
-RECENT_REQUEST_LOG: list[dict] = []  # {"ts": float, "uuid": str, "endpoint": str}
-RECENT_REQUEST_LOG_WINDOW_S = 30.0
-RECENT_REQUEST_LOG_MAX = 10_000
-
 
 def _make_logger() -> logging.Logger:
     logger = logging.getLogger(SERVICE_NAME)
@@ -165,25 +152,3 @@ def get_client_ip(request) -> str:
     return ""
 
 
-def log_request(ts: float, uid: str, endpoint: str) -> None:
-    """Record a core-API call for OPS-API-2 (last-30s user count).
-    记录一次核心 API 调用,供 OPS-API-2(最近 30 秒用户数)使用."""
-    RECENT_REQUEST_LOG.append({"ts": ts, "uuid": uid, "endpoint": endpoint})
-    _prune_recent(ts)
-
-
-def count_unique_users(seconds: float = RECENT_REQUEST_LOG_WINDOW_S) -> int:
-    """Count distinct user uuids that hit a core API within the last window.
-    统计最近窗口内访问过核心 API 的不同用户 uuid 数量."""
-    now = time.time()
-    cutoff = now - seconds
-    return len({entry["uuid"] for entry in RECENT_REQUEST_LOG if entry["ts"] >= cutoff})
-
-
-def _prune_recent(now: float) -> None:
-    """Drop entries older than the window (and enforce a hard size cap).
-    丢弃超出窗口的记录(并强制限制列表大小)."""
-    cutoff = now - RECENT_REQUEST_LOG_WINDOW_S
-    RECENT_REQUEST_LOG[:] = [e for e in RECENT_REQUEST_LOG if e["ts"] >= cutoff]
-    if len(RECENT_REQUEST_LOG) > RECENT_REQUEST_LOG_MAX:
-        del RECENT_REQUEST_LOG[: len(RECENT_REQUEST_LOG) - RECENT_REQUEST_LOG_MAX]

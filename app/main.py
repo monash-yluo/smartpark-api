@@ -41,13 +41,12 @@ from fastapi.responses import JSONResponse
 from .cache import TTLCache
 from .config import CarPark, load_platform_config
 from .inference import Detector, build_detector
+from .firestore_store import FirestoreStore
 from .logging_utils import (
     build_user_id,
-    count_unique_users,
     current_uuid,
     get_client_ip,
     log,
-    log_request,
     resolve_uuid,
 )
 from .takephoto import TakephotoError, fetch_image
@@ -82,6 +81,7 @@ async def lifespan(app: FastAPI):
     app.state.cache = TTLCache(default_ttl=config.request_cache_ttl_s)
     app.state.inflight_analyses = {}
     app.state.inflight_analyses_lock = asyncio.Lock()
+    app.state.firestore = FirestoreStore()
     # The model is loaded from disk at runtime (MODEL_PATH). If it is not
     # available (e.g. local dev), build_detector returns a MockDetector so the
     # endpoints still boot and can be tested. On GKE, MODEL_PATH points at the
@@ -111,6 +111,7 @@ async def lifespan(app: FastAPI):
         await _shutdown_inflight_analyses(app)
     finally:
         await app.state.http.aclose()
+        await app.state.firestore.close()
 
 
 app = FastAPI(title="smartpark-api", version="1.0.0", lifespan=lifespan)
@@ -369,7 +370,10 @@ async def find_carparks(
         "failed_carparks": len(chosen) - len(ok),
         "results": top,
     }
-    log_request(time.time(), user_id, "find-carparks")
+    try:
+        await app.state.firestore.record_user(user_id)
+    except Exception as exc:  # noqa: BLE001 - telemetry must not break core API
+        log.error("Firestore user activity write failed: %s", exc)
     return payload
 
 
@@ -405,7 +409,10 @@ async def annotate_carpark(
     # for OPS-API-2 (distinct users in last 30s).
     # 车场存在后即为一次有效的 CORE-API-2 调用.在处理前记录,这样即使拉图/分析失败,
     # 该用户仍会计入 OPS-API-2(最近 30 秒不同用户数).
-    log_request(time.time(), user_id, "annotate-carpark")
+    try:
+        await app.state.firestore.record_user(user_id)
+    except Exception as exc:  # noqa: BLE001 - telemetry must not break core API
+        log.error("Firestore user activity write failed: %s", exc)
 
     analysis = await _get_carpark_analysis(carpark)
     if analysis is None:
@@ -452,10 +459,34 @@ async def ops_carparks():
 @app.get("/api/ops/users")
 async def ops_users():
     """统计最近 30 秒访问过有效 API 的不同用户数量。"""
+    if not app.state.firestore.enabled:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "msg": "shared user activity tracking is disabled",
+                "detail": "Set FIRESTORE_ENABLED=1 and configure Google credentials",
+                "window_seconds": 30,
+            },
+        )
+    try:
+        users_last_30s = await app.state.firestore.count_recent_users(30.0)
+    except Exception as exc:  # noqa: BLE001 - expose dependency failure to operator
+        log.error("Firestore user activity read failed: %s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "msg": "shared user activity store is unavailable",
+                "detail": "Firestore is not reachable or credentials are invalid",
+                "window_seconds": 30,
+            },
+        )
     return {
         "status": "success",
-        "users_last_30s": count_unique_users(30.0),
+        "users_last_30s": users_last_30s,
         "window_seconds": 30,
+        "source": "firestore",
     }
 
 

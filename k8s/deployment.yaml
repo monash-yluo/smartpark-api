@@ -44,6 +44,8 @@ spec:
               value: /data/model.pt
             - name: CARPARKS_CONFIG
               value: /app/config/carparks.json
+            - name: FIRESTORE_ENABLED
+              value: "1"
           ports:
             - name: http
               containerPort: 8000
