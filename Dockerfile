@@ -33,11 +33,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY config ./config
 
-# Runtime knobs. The model path points at the mounted volume (PVC) on GKE, so the
-# model is NOT baked into the image (the "updateable model" point).
+# Runtime knobs. In Kubernetes, MODEL_PATH is overridden to /data/model.pt,
+# which is populated by an initContainer from GCS into a shared emptyDir volume.
+# The model is deliberately not copied into this image.
 # 运行时参数.模型路径指向 GKE 上挂载的卷(PVC),所以模型不烤进镜像("可更新模型"要点).
 ENV PORT=8000
-ENV MODEL_PATH=/models/model.pt
+ENV MODEL_PATH=/data/model.pt
 ENV CARPARKS_CONFIG=/app/config/carparks.json
 
 EXPOSE 8000

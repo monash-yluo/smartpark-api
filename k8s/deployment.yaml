@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smartpark-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: smartpark-api
+  template:
+    metadata:
+      labels:
+        app: smartpark-api
+    spec:
+      volumes:
+        - name: model-data
+          emptyDir: {}
+        - name: carparks-config
+          configMap:
+            name: smartpark-carparks
+      initContainers:
+        - name: download-model
+          image: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
+          env:
+            - name: MODEL_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: smartpark-model-config
+                  key: MODEL_URI
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              set -eu;
+              gsutil cp "${MODEL_URI}" /data/model.pt;
+              test -s /data/model.pt
+          volumeMounts:
+            - name: model-data
+              mountPath: /data
+      containers:
+        - name: smartpark-api
+          image: REGION-docker.pkg.dev/PROJECT_ID/smartpark/api:TAG
+          env:
+            - name: MODEL_PATH
+              value: /data/model.pt
+            - name: CARPARKS_CONFIG
+              value: /app/config/carparks.json
+          ports:
+            - name: http
+              containerPort: 8000
+          volumeMounts:
+            - name: model-data
+              mountPath: /data
+              readOnly: true
+            - name: carparks-config
+              mountPath: /app/config/carparks.json
+              subPath: carparks.json
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi

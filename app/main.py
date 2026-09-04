@@ -83,9 +83,11 @@ async def lifespan(app: FastAPI):
     app.state.inflight_analyses_lock = asyncio.Lock()
     # The model is loaded from disk at runtime (MODEL_PATH). If it is not
     # available (e.g. local dev), build_detector returns a MockDetector so the
-    # endpoints still boot and can be tested. On GKE, MODEL_PATH is a mounted PVC.
+    # endpoints still boot and can be tested. On GKE, MODEL_PATH points at the
+    # shared emptyDir populated by the GCS-download initContainer.
     # 模型在运行时从磁盘加载(MODEL_PATH).若不可用(例如本地开发),
-    # build_detector 会返回 MockDetector,使端点仍能启动并测试.在 GKE 上 MODEL_PATH 是挂载的 PVC.
+    # build_detector 会返回 MockDetector,使端点仍能启动并测试.在 GKE 上 MODEL_PATH 指向
+    # 由 GCS 下载 initContainer 填充的共享 emptyDir.
     app.state.detector = build_detector(config.model_path, config.inference_workers)
     # 异步 HTTP 客户端 主动去调 takephoto（Cloud Run）拉图
     app.state.http = httpx.AsyncClient(timeout=config.takephoto_timeout_s)

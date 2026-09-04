@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smartpark-model-config
+data:
+  # Change this object reference, then rollout restart the Deployment.
+  MODEL_URI: gs://REPLACE_WITH_BUCKET/model-v1.pt

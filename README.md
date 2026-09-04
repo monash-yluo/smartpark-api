@@ -61,9 +61,11 @@ MODEL_PATH to the model.pt / model.onnx file.
 1. Car park discovery = single source of truth. The platform loads car parks from
    carparks.json at startup. On GKE that JSON is a ConfigMap mounted into every
    replica, so editing one place updates the whole cluster.
-2. Updateable model. Weights are NOT copied into the image. The app reads
-   MODEL_PATH at runtime (a mounted PVC on GKE), so swapping the file updates the
-   model without rebuilding the container.
+2. Updateable model. Weights are NOT copied into the image. On GKE, an
+   initContainer downloads the selected GCS object into a shared `emptyDir`
+   volume, and the app reads it through `MODEL_PATH=/data/model.pt`. Changing
+   the model URI in the ConfigMap and restarting the Deployment makes new Pods
+   load the new model without rebuilding the application image.
 3. Inference does not block the event loop. YOLO is synchronous and CPU-bound, so
    it runs on a ThreadPoolExecutor via loop.run_in_executor; the route just awaits
    it (see app/inference.py). This is the core "bottleneck + mitigation" point.
@@ -91,6 +93,46 @@ MODEL_PATH to the model.pt / model.onnx file.
 ## Next steps
 
 - OPS-REQ-2 dashboard (matplotlib on demand).
-- GKE manifests (namespace, ConfigMap, PVC for the model, Deployment, LoadBalancer
-  Service, HPA) and real deployment.
+- GKE manifests (namespace, ConfigMaps, node service-account IAM permission,
+  Deployment, LoadBalancer Service, HPA) and real deployment. The model uses
+  GCS + an initContainer + shared `emptyDir`, rather than a PVC.
+
+## Runtime model deployment
+
+The model file is intentionally absent from the Docker build context and image.
+Upload it to a private GCS bucket, set `MODEL_URI` in
+`k8s/model-configmap.yaml`, and grant the GKE node pool service account
+`storage.objects.get` (or `roles/storage.objectViewer`). The Deployment does
+not specify `serviceAccountName`; Pods use the namespace `default` ServiceAccount
+and access GCS through the node identity in the current cluster setup.
+The VM-side command below tests the same download operation used by the
+initContainer before deploying to GKE:
+
+```bash
+gcloud auth application-default login
+MODEL_URI=gs://YOUR_BUCKET/model-v1.pt ./scripts/download_model_vm.sh
+```
+
+Build and push the lightweight image to Artifact Registry:
+
+```bash
+gcloud auth configure-docker REGION-docker.pkg.dev
+docker build -t REGION-docker.pkg.dev/PROJECT_ID/smartpark/api:TAG .
+docker push REGION-docker.pkg.dev/PROJECT_ID/smartpark/api:TAG
+```
+
+The Kubernetes Deployment replaces `REGION`, `PROJECT_ID`, and `TAG` in its
+image field. The initContainer downloads one model per new Pod into `emptyDir`;
+changing `MODEL_URI` therefore requires `kubectl rollout restart deployment/smartpark-api`.
+
+Create the car-park ConfigMap referenced by `k8s/deployment.yaml`, then apply the
+model configuration and Deployment:
+
+```bash
+kubectl create configmap smartpark-carparks \
+   --from-file=carparks.json=config/carparks.json \
+   --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f k8s/model-configmap.yaml
+kubectl apply -f k8s/deployment.yaml
+```
 - Locust script + benchmark report for 1/2/4/8 replicas.

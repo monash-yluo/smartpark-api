@@ -25,13 +25,14 @@ much easier to share the loaded model across workers.
 因此线程能带来接近线性的加速,且没有进程池的 pickle 开销和内存复制.跨 worker 共享已加载
 模型也容易得多.
 
-Model loading is intentionally NOT part of the image build: we load the weights
-from MODEL_PATH at runtime (a mounted volume / PVC on GKE), so the model can be
-updated without rebuilding the container. See build_detector() which falls back
-to a MockDetector when no real model is present - useful for local dev/testing.
-模型加载刻意不放入镜像构建:我们在运行时从 MODEL_PATH 加载权重(GKE 上的挂载卷 / PVC),
-这样无需重建容器即可更新模型.见 build_detector(),当没有真实模型时会回退到 MockDetector,
-便于本地开发/测试.
+Model loading is intentionally NOT part of the image build: on GKE an
+initContainer downloads weights from GCS into a shared emptyDir, and we load the
+file from MODEL_PATH. The model can therefore change without rebuilding the app
+image. See build_detector(), which falls back to a MockDetector when no real
+model is present - useful for local dev/testing.
+模型加载刻意不放入镜像构建:在 GKE 上,initContainer 从 GCS 下载权重到共享 emptyDir,
+我们再从 MODEL_PATH 加载该文件.因此模型更新不需要重建应用镜像.见 build_detector(),
+当没有真实模型时会回退到 MockDetector,便于本地开发/测试.
 """
 
 from __future__ import annotations
@@ -153,12 +154,13 @@ def build_detector(model_path: Path, workers: int = 4) -> Detector | MockDetecto
     如果模型文件存在且能加载则返回真实 Detector,否则返回 MockDetector.
 
     This is where the "updateable model" idea is honoured: the model is read from
-    disk at runtime (not baked into the image). On GKE you mount the weights via a
-    PVC (see k8s/pvc.yaml) and point MODEL_PATH at it; swapping the file under the
-    mount updates the model without rebuilding the container.
-    这正是"可更新模型"理念的体现:模型在运行时从磁盘读取(不烤进镜像).
-    在 GKE 上你通过 PVC 挂载权重(见 k8s/pvc.yaml)并将 MODEL_PATH 指向它;
-    只需替换挂载下的文件即可更新模型,无需重建容器.
+    disk at runtime, not baked into the image. On GKE, an initContainer downloads
+    the selected GCS object into a shared emptyDir and MODEL_PATH points at it.
+    Changing the object reference and restarting the Deployment loads a new model
+    without rebuilding the application image.
+    这正是"可更新模型"理念的体现:模型在运行时从磁盘读取,不烤进镜像.
+    在 GKE 上,initContainer 将选定的 GCS 对象下载到共享 emptyDir,MODEL_PATH 指向该文件.
+    修改对象引用并重启 Deployment 后,新 Pod 会加载新模型,无需重建应用镜像.
     """
     if model_path and Path(model_path).is_file():
         try:
