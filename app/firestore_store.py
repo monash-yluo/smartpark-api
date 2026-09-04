@@ -38,9 +38,7 @@ class FirestoreStore:
         client = self._get_client()
         if client is None:
             return False
-        await client.collection("active_users").document("__healthcheck__").get(
-            timeout=timeout_s
-        )
+        await client.collection("active_users").limit(1).get(timeout=timeout_s)
         return True
 
     @staticmethod
