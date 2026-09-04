@@ -4,4 +4,4 @@ metadata:
   name: smartpark-model-config
 data:
   # Change this object reference, then rollout restart the Deployment.
-  MODEL_URI: gs://REPLACE_WITH_BUCKET/model-v1.pt
+  MODEL_URI: gs://yluo0117-fit3184-a1/model.pt
