@@ -78,6 +78,7 @@ async def lifespan(app: FastAPI):
     # 加载本地config
     config = load_platform_config()
     app.state.config = config
+    log.info("initialized %d car parks", len(config.carparks))
     app.state.cache = TTLCache(default_ttl=config.request_cache_ttl_s)
     app.state.inflight_analyses = {}
     app.state.inflight_analyses_lock = asyncio.Lock()
