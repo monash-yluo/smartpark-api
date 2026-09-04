@@ -12,6 +12,7 @@ class FirestoreStore:
 
     def __init__(self) -> None:
         self._client = None
+        self._database = os.getenv("FIRESTORE_DATABASE", "(default)")
         self._disabled = os.getenv("FIRESTORE_ENABLED", "1").lower() not in {
             "1",
             "true",
@@ -28,7 +29,7 @@ class FirestoreStore:
         if self._client is None:
             from google.cloud.firestore_v1 import AsyncClient, SERVER_TIMESTAMP
 
-            self._client = AsyncClient()
+            self._client = AsyncClient(database=self._database)
             self._server_timestamp = SERVER_TIMESTAMP
         return self._client
 

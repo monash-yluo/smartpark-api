@@ -54,6 +54,7 @@ MODEL_PATH to the model.pt / model.onnx file.
 - TAKEPHOTO_TIMEOUT  seconds for camera calls     (default 10)
 - INFERENCE_WORKERS  YOLO thread-pool size        (default 4)
 - REQUEST_CACHE_TTL  per-car-park analysis cache TTL seconds   (default 30)
+- FIRESTORE_DATABASE Firestore database ID (default `(default)`)
 - PORT             listen port                    (default 8000)
 
 ## Key design decisions (worth explaining in the interview)
