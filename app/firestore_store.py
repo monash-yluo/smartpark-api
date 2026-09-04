@@ -67,10 +67,9 @@ class FirestoreStore:
         query = client.collection("active_users").where(
             filter=FieldFilter("last_seen_at", ">=", cutoff)
         )
-        count = 0
-        async for _ in query.stream():
-            count += 1
-        return count
+        aggregation = query.count(alias="user_count")
+        results = await aggregation.get()
+        return results[0][0].value
 
     async def close(self) -> None:
         if self._client is not None:

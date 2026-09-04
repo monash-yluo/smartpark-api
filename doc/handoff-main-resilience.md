@@ -1,8 +1,9 @@
 # Handoff: API 韧性、按停车场缓存与 Single-Flight
 
 > 供后续 AI 会话/开发者快速接手的交接文档。
-> 对象文件:`app/main.py`
-> 更新日期:2026-09-02
+> 对象文件:`app/main.py`、`app/firestore_store.py`、`app/logging_utils.py`、
+> `k8s/deployment.yaml`
+> 更新日期:2026-09-05
 
 ## 背景
 
@@ -217,6 +218,284 @@ REQUEST_CACHE_REFRESH_AFTER=20
 新增测试验证：刷新窗口内的两个并发调用立刻取得旧缓存，只运行一次后台推理，后台完成后
 缓存替换为新结果。
 
+### 10. OPS-API-2 改用 Firestore 做跨 Pod 用户统计
+
+原实现把最近请求保存在 `app/logging_utils.py` 的进程内列表中。该列表只属于单个 Pod，
+LoadBalancer 将请求分发给多个副本后，任一 Pod 的 `/api/ops/users` 都只能看到局部流量，
+会产生看似正常但实际偏小的错误结果。
+
+现已删除以下内存统计实现：
+
+- `RECENT_REQUEST_LOG`
+- `log_request()`
+- `count_unique_users()`
+- `_prune_recent()` 及相关窗口/容量常量
+
+结构化 stdout 日志仍由 `logging_utils.py` 和 middleware 输出，继续满足 OPS-REQ-1 的
+时间戳、级别、服务名和 UUID 要求。OPS-API-2 的共享状态则由 Firestore 提供。
+
+新增 `app/firestore_store.py`，核心数据模型为：
+
+```text
+active_users/
+    <sha256(user_id)>/
+        user_id: "user:test-001"
+        last_seen_at: <Firestore server timestamp>
+```
+
+SHA-256 仅作为稳定且路径安全的 document ID：同一个完整 `user_id` 总是映射到同一个
+document，不同用户映射到不同 document。明文 `user_id` 同时保存在字段中，便于控制台
+演示和排查。若未来 UUID 可能包含真实姓名、邮箱或学号，应重新评估是否保留明文字段。
+
+写入使用：
+
+```python
+document(hash(user_id)).set(
+        {"user_id": user_id, "last_seen_at": SERVER_TIMESTAMP},
+        merge=True,
+)
+```
+
+所以同一用户重复访问只更新 `last_seen_at`，不会创建多份记录。两个核心 API 都会记录：
+
+- `find_carparks`：成功产生业务结果后记录；
+- `annotate_carpark`：确认车场 ID 有效后、分析前记录，因此后续相机/推理失败仍算一次有效使用。
+
+Firestore 写入属于运营遥测依赖。写失败时核心 API 只输出 ERROR 日志，仍返回业务结果，
+避免监控依赖拖垮停车查询。`/api/ops/users` 则只信任 Firestore：未启用或读取失败时返回
+HTTP 503，不再回退到误导性的单 Pod 内存数字。
+
+最近 30 秒统计按 `last_seen_at >= UTC now - 30s` 查询。当前代码使用
+`FieldFilter`，避免旧 positional `where()` API 的警告，并使用 Firestore 服务端
+`count()` aggregation：
+
+```python
+aggregation = query.count(alias="user_count")
+results = await aggregation.get()
+return results[0][0].value
+```
+
+因此 Firestore 在服务端计算匹配 document 数量，只把一个整数返回给 Pod，而不是把
+所有活跃用户 document 通过 async stream 传回后再由 Python 计数。这样能减少网络传输、
+Pod 内存使用和 `/api/ops/users` 的本地遍历开销；代价是 Firestore 仍会按 aggregation
+查询计费，且查询结果会反映 Firestore 当时可见的数据。
+
+### 11. Firestore 配置与部署
+
+依赖已加入 `requirements.txt`：
+
+```text
+google-cloud-firestore
+```
+
+运行时环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `FIRESTORE_ENABLED` | `1` | 默认启用；显式设为 `0` 时 OPS-API-2 返回 503 |
+| `FIRESTORE_DATABASE` | `(default)` | Firestore Database ID，不是 Project ID 或 collection 名 |
+
+本项目实际 Database ID 为：
+
+```text
+fit3184-a1
+```
+
+因此 VM Docker 测试必须传：
+
+```bash
+-e FIRESTORE_DATABASE=fit3184-a1
+```
+
+`k8s/deployment.yaml` 也应保持：
+
+```yaml
+- name: FIRESTORE_ENABLED
+    value: "1"
+- name: FIRESTORE_DATABASE
+    value: "fit3184-a1"
+```
+
+Database ID 是部署配置，不应写死在 Dockerfile。修改 Python 代码或 `requirements.txt` 后，
+必须重新 build image；只重启旧容器不会获得新代码。
+
+Firestore 使用 Google Application Default Credentials。项目级 IAM 已给以下 Compute
+Engine 默认服务账号授权：
+
+```text
+87185953953-compute@developer.gserviceaccount.com
+roles/datastore.user
+```
+
+`roles/datastore.user` 是 Firestore/Datastore document 读写角色，不是 GCS bucket 角色。
+Firebase Security Rules 主要约束客户端 SDK；本后端 Google Cloud SDK 使用 IAM，不在 Rules
+页面给服务账号授权。
+
+GKE 集群 `fit3184-a1` 的 `default-pool` 已只读确认配置如下：
+
+```yaml
+config:
+    serviceAccount: default
+    oauthScopes:
+    - https://www.googleapis.com/auth/cloud-platform
+```
+
+因此 Node Pool 后续从 0 扩回任意节点数时，新 Node 自动继承账号与 scope；HPA 扩到多个
+Pod 也无需逐个授权。集群已启用 Workload Identity，后续可升级为专用 KSA/GSA；当前作业
+实现暂时使用 Node 的 Compute Engine 默认账号。
+
+### 12. Firestore 实际踩坑记录
+
+#### 12.1 IAM role 正确但 VM token scope 不足
+
+VM `w6lab` 初始报错：
+
+```text
+403 Request had insufficient authentication scopes
+ACCESS_TOKEN_SCOPE_INSUFFICIENT
+```
+
+当时 service account 已有 `roles/datastore.user`，但 VM metadata 只有 Storage read-only、
+Logging、Monitoring 等有限 scopes，没有 `cloud-platform`。IAM role 和 VM OAuth scope 是
+两层约束，必须同时允许。
+
+修复时停止 VM，并把 service account scope 改为：
+
+```text
+https://www.googleapis.com/auth/cloud-platform
+```
+
+重启后已确认 `w6lab` 的 metadata 为：
+
+```text
+service account: 87185953953-compute@developer.gserviceaccount.com
+scope: https://www.googleapis.com/auth/cloud-platform
+```
+
+注意：这是测试 VM 自身的问题；GKE `default-pool` 原本就已有正确 scope。
+
+#### 12.2 SDK 默认寻找 `(default)` 数据库
+
+客户端最初使用：
+
+```python
+AsyncClient()
+```
+
+实际数据库 ID 是 `fit3184-a1`，因此报错：
+
+```text
+404 The database (default) does not exist
+```
+
+修复为读取 `FIRESTORE_DATABASE` 并显式传入：
+
+```python
+AsyncClient(database=self._database)
+```
+
+#### 12.3 `__healthcheck__` 是保留资源 ID
+
+启动连接检查最初读取 document `__healthcheck__`，Firestore 返回：
+
+```text
+400 Resource id "__healthcheck__" is invalid because it is reserved
+```
+
+修复为不创建数据的只读查询：
+
+```python
+await client.collection("active_users").limit(1).get(timeout=timeout_s)
+```
+
+collection 不存在或为空时仍可用于验证数据库、身份和权限。
+
+#### 12.4 不能用同步 `sum()` 消费 async generator
+
+查询最初写成：
+
+```python
+sum(1 async for _ in query.stream())
+```
+
+运行时报：
+
+```text
+'async_generator' object is not iterable
+```
+
+修复为显式异步遍历并累加：
+
+```python
+count = 0
+async for _ in query.stream():
+        count += 1
+```
+
+同时把旧式 `where("last_seen_at", ">=", cutoff)` 改为
+`where(filter=FieldFilter(...))`，消除 positional arguments 警告。
+
+之后进一步将计数改为 Firestore 服务端 aggregation `count()`，所以最终实现不再使用
+上述 `async for` 逐条拉取计数；该错误仍保留在此处作为历史踩坑记录。
+
+#### 12.5 镜像 tag 与工作区代码容易不同步
+
+VM 多次测试使用本地 image tag `smartpark-api:v2`。每次修改代码后必须重新 build，确保
+运行日志来自新镜像；tag 名本身不会自动更新内容。GKE Deployment 当前引用的 registry tag
+也必须指向包含 Firestore 代码和依赖的镜像，不能只更新 YAML 后继续运行旧 `v1`。
+
+### 13. Firestore 验证流程
+
+VM Docker 启动示例：
+
+```bash
+docker run --rm \
+    --name smartpark-api-test \
+    -p 8000:8000 \
+    -e FIRESTORE_DATABASE=fit3184-a1 \
+    -e MODEL_PATH=/data/model.pt \
+    -v ~/smartpark-models:/data:ro \
+    smartpark-api:<latest-local-tag>
+```
+
+成功启动应出现：
+
+```text
+Firestore status | enabled=true | reachable=true
+```
+
+然后先触发带 UUID 的有效核心请求，并在 30 秒内查询：
+
+```bash
+curl "http://127.0.0.1:8000/api/annotate-carpark?carpark_id=CBD_001&uuid=test-001"
+curl "http://127.0.0.1:8000/api/ops/users"
+```
+
+预期 OPS 响应：
+
+```json
+{
+    "status": "success",
+    "users_last_30s": 1,
+    "window_seconds": 30,
+    "source": "firestore"
+}
+```
+
+同一 UUID 重复请求仍只占一个 document；不同 UUID 各占一个 document。超过 30 秒的旧
+document 可以保留，因为范围查询不会计入；是否配置 TTL 清理属于后续优化。
+
+### 14. 题意风险：OPS-API-2 要求“derived by querying request logs”
+
+作业原文明确写 OPS-API-2 应从 OPS-REQ-1 请求日志查询得出。当前实现保留完整结构化 stdout
+日志，但 Firestore 中只保存每个用户的 `last_seen_at` 聚合状态，而不是每一次请求事件。
+工程上它能正确完成跨 Pod 的 30 秒去重统计，但严格阅卷时可能被追问“是否真的查询日志”。
+
+面试中应说明 Firestore document 是由每次有效核心请求产生/更新的共享 operational activity
+record，而 stdout/Cloud Logging 保存完整请求日志。若 rubric 严格要求直接查询逐条日志，后续
+应考虑将请求事件写入带时间戳的 Firestore event collection，再做 distinct 聚合，或由 Cloud
+Logging 导出到可查询存储；这会增加写入量、查询复杂度和成本，需与教学团队确认。
+
 ## 现在的响应语义(三级)
 
 | 场景 | HTTP 状态 | 说明 |
@@ -256,6 +535,11 @@ REQUEST_CACHE_REFRESH_AFTER=20
     可每次拉图后按图片哈希缓存推理结果,但这样不能省掉相机请求。
 - [ ] **优先级低:** 可以给缓存命中/未命中、single-flight 等待、推理耗时增加指标,
     便于 Locust 和 GKE 压测判断优化是否有效。
+- [ ] **优先级低:** 先用 Locust 对比 Firestore 写入开启前后的 P95 延迟和 QPS；如果
+    Firestore 写入成为瓶颈，再考虑同一 Pod 内按 user ID 做 3-5 秒写入节流。节流只减少
+    重复写入，不改变 30 秒 distinct-user 的语义，但会让 `last_seen_at` 有少量更新延迟。
+- [ ] **优先级低:** 保持 Firestore 的 `count()` aggregation，不要在 dashboard 请求中
+    stream 全部活跃用户；只有需要展示用户明细时才增加单独的分页查询。
 - [ ] **优先级低:** `TTLCache` 使用 `time.time()` 计算年龄，系统时间回拨或跳跃可能使
     TTL/刷新窗口不准确；若需要更稳健的本地计时，可改为 `time.monotonic()`。
 - [ ] `ops_carparks` 是否在全部停车场失败时返回 503 仍需按作业语义决定;当前保持原行为。
