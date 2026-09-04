@@ -14,14 +14,12 @@ convenient, concurrency-friendly way to pull many images in parallel.
 from __future__ import annotations
 
 import base64
-import logging
 from typing import Optional
 
 import httpx
 
 from .config import CarPark
-
-log = logging.getLogger("smartpark.takephoto")
+from .logging_utils import log
 
 
 class TakephotoError(RuntimeError):

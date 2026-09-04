@@ -24,12 +24,11 @@ take-photo service to hit - the operator supplies them at runtime.
 from __future__ import annotations
 
 import json
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-log = logging.getLogger("smartpark.config")
+from .logging_utils import log
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "carparks.json"
 

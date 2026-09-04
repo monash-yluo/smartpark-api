@@ -40,13 +40,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
-import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PIL import Image
 
-log = logging.getLogger("smartpark.inference")
+from .logging_utils import log
 
 
 class Detector:
