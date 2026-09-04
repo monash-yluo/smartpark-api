@@ -12,7 +12,7 @@ class FirestoreStore:
 
     def __init__(self) -> None:
         self._client = None
-        self._disabled = os.getenv("FIRESTORE_ENABLED", "0").lower() not in {
+        self._disabled = os.getenv("FIRESTORE_ENABLED", "1").lower() not in {
             "1",
             "true",
             "yes",
