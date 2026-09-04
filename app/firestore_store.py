@@ -32,6 +32,16 @@ class FirestoreStore:
             self._server_timestamp = SERVER_TIMESTAMP
         return self._client
 
+    async def check_connection(self, timeout_s: float = 5.0) -> bool:
+        """Issue a read-only request to verify Firestore credentials and access."""
+        client = self._get_client()
+        if client is None:
+            return False
+        await client.collection("active_users").document("__healthcheck__").get(
+            timeout=timeout_s
+        )
+        return True
+
     @staticmethod
     def _document_id(user_id: str) -> str:
         return hashlib.sha256(user_id.encode("utf-8")).hexdigest()

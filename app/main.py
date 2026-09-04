@@ -82,6 +82,17 @@ async def lifespan(app: FastAPI):
     app.state.inflight_analyses = {}
     app.state.inflight_analyses_lock = asyncio.Lock()
     app.state.firestore = FirestoreStore()
+    if not app.state.firestore.enabled:
+        log.info("Firestore status | enabled=false | reachable=not-checked")
+    else:
+        try:
+            await app.state.firestore.check_connection()
+        except Exception as exc:  # noqa: BLE001 - Firestore is an optional operational dependency
+            log.warning(
+                "Firestore status | enabled=true | reachable=false | error=%s", exc
+            )
+        else:
+            log.info("Firestore status | enabled=true | reachable=true")
     # The model is loaded from disk at runtime (MODEL_PATH). If it is not
     # available (e.g. local dev), build_detector returns a MockDetector so the
     # endpoints still boot and can be tested. On GKE, MODEL_PATH points at the
