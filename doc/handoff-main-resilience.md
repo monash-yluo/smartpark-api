@@ -287,3 +287,41 @@ REQUEST_CACHE_REFRESH_AFTER=20
     `asyncio.Lock` 是两个不同层次的锁。
 - RESTful 语义:单点故障降级(200 + 部分结果)是**有意为之的韧性设计**,
   不应为了个别失败返回 4xx/5xx。
+
+## 文档同步: ConfigMap 与 VM Docker 验证
+
+> 更新日期:2026-09-04。
+
+本次将完整操作流程同步到 `README.md`，包括以下内容:
+
+- `config/carparks.json` 通过 `kubectl create configmap ... --from-file` 生成或更新
+    `smartpark-carparks` ConfigMap；该 ConfigMap 在 GKE 中挂载到
+    `/app/config/carparks.json`。
+- 修改车场配置后执行 `kubectl apply`（或重新生成 ConfigMap）以及
+    `kubectl rollout restart deployment/smartpark-api`，因为应用只在启动时加载配置，
+    不承诺实时热更新。
+- Compute Engine VM 上使用 `gcloud storage cp` 将
+    `gs://YOUR_BUCKET/model.pt` 下载到 `~/smartpark-models/model.pt`。
+- VM 上构建镜像:
+
+    ```bash
+    docker build -t smartpark-api:v1 .
+    ```
+
+- VM 上运行容器时使用:
+
+    ```bash
+    docker run --rm --name smartpark-api-test -p 8000:8000 \
+        -e MODEL_PATH=/data/model.pt \
+        -v ~/smartpark-models:/data:ro \
+        smartpark-api:v1
+    ```
+
+    模型留在 VM 主机上，通过 Docker bind mount 进入 `/data/model.pt`，没有被复制进镜像。
+- 在另一个 VM 终端通过 `docker exec`、`curl /healthz` 和 `docker logs` 验证模型文件、服务
+    状态与 detector 模式。真实模型应显示 `Using REAL YOLO detector` 和
+    `detector=real-yolo`；`detector=mock` 表示模型不存在或加载失败。
+- `scripts/download_model_vm.sh` 没有执行权限时，可以使用
+    `bash scripts/download_model_vm.sh ...`，不必修改文件权限。
+- 文档明确说明 Base64 图片很长不能证明使用真实模型；MockDetector 会原样返回输入图片，
+    应以启动日志中的 detector 模式为准。

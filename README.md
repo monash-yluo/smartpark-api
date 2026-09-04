@@ -105,13 +105,85 @@ Upload it to a private GCS bucket, set `MODEL_URI` in
 `storage.objects.get` (or `roles/storage.objectViewer`). The Deployment does
 not specify `serviceAccountName`; Pods use the namespace `default` ServiceAccount
 and access GCS through the node identity in the current cluster setup.
-The VM-side command below tests the same download operation used by the
-initContainer before deploying to GKE:
+
+### Generate the car-park ConfigMap
+
+`carparks.json` is small enough for a ConfigMap. The source file remains in the
+repository, while the command below creates or updates the Kubernetes resource
+from that file:
 
 ```bash
-gcloud auth application-default login
-MODEL_URI=gs://YOUR_BUCKET/model-v1.pt ./scripts/download_model_vm.sh
+kubectl create configmap smartpark-carparks \
+   --from-file=carparks.json=config/carparks.json \
+   --dry-run=client -o yaml | kubectl apply -f -
 ```
+
+This ConfigMap is mounted by `k8s/deployment.yaml` at
+`/app/config/carparks.json`. The application reads it during startup, so apply
+the ConfigMap and restart the Deployment after changing `carparks.json`:
+
+```bash
+kubectl rollout restart deployment/smartpark-api
+kubectl rollout status deployment/smartpark-api
+```
+
+### Test on a Compute Engine VM
+
+The VM test deliberately keeps the model outside the image. The VM host first
+downloads the model from GCS, then Docker bind-mounts the host directory into
+the application container. The container reads `/data/model.pt` through
+`MODEL_PATH`.
+
+```bash
+mkdir -p ~/smartpark-models
+gcloud storage cp \
+   gs://YOUR_BUCKET/model.pt \
+   ~/smartpark-models/model.pt
+ls -lh ~/smartpark-models/model.pt
+test -s ~/smartpark-models/model.pt && echo "model download succeeded"
+```
+
+The equivalent helper script is executable through `bash` even when the file
+does not have the Linux execute bit:
+
+```bash
+MODEL_URI=gs://YOUR_BUCKET/model.pt \
+   bash scripts/download_model_vm.sh \
+   ~/smartpark-models/model.pt
+```
+
+Build and run the image on the VM:
+
+```bash
+docker build -t smartpark-api:v1 .
+docker run --rm \
+   --name smartpark-api-test \
+   -p 8000:8000 \
+   -e MODEL_PATH=/data/model.pt \
+   -v ~/smartpark-models:/data:ro \
+   smartpark-api:v1
+```
+
+The `-v` option makes the VM host file visible inside the container; it does
+not copy the model into the image. In a second VM terminal, verify the model
+file, health endpoint, and detector mode:
+
+```bash
+docker exec smartpark-api-test ls -lh /data/model.pt
+curl http://127.0.0.1:8000/healthz
+docker logs smartpark-api-test 2>&1 | grep -Ei 'loading yolo|real yolo|mock|could not load|detector'
+```
+
+The startup log must contain:
+
+```text
+Using REAL YOLO detector from /data/model.pt
+detector=real-yolo
+```
+
+`detector=mock` means that the model file was not found or could not be loaded.
+The Base64 image length alone cannot distinguish real YOLO from MockDetector;
+MockDetector returns the original image without drawing detection boxes.
 
 Build and push the lightweight image to Artifact Registry:
 
