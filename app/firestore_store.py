@@ -57,11 +57,16 @@ class FirestoreStore:
         client = self._get_client()
         if client is None:
             return 0
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=seconds)
         query = client.collection("active_users").where(
-            "last_seen_at", ">=", cutoff
+            filter=FieldFilter("last_seen_at", ">=", cutoff)
         )
-        return sum(1 async for _ in query.stream())
+        count = 0
+        async for _ in query.stream():
+            count += 1
+        return count
 
     async def close(self) -> None:
         if self._client is not None:
