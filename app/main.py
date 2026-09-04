@@ -40,7 +40,7 @@ from fastapi.responses import JSONResponse
 
 from .cache import TTLCache
 from .config import CarPark, load_platform_config
-from .inference import build_detector
+from .inference import Detector, build_detector
 from .logging_utils import (
     build_user_id,
     count_unique_users,
@@ -89,14 +89,16 @@ async def lifespan(app: FastAPI):
     # build_detector 会返回 MockDetector,使端点仍能启动并测试.在 GKE 上 MODEL_PATH 指向
     # 由 GCS 下载 initContainer 填充的共享 emptyDir.
     app.state.detector = build_detector(config.model_path, config.inference_workers)
+    detector_mode = "real-yolo" if isinstance(app.state.detector, Detector) else "mock"
     # 异步 HTTP 客户端 主动去调 takephoto（Cloud Run）拉图
     app.state.http = httpx.AsyncClient(timeout=config.takephoto_timeout_s)
 
     log.info(
-        "started | carparks=%d | inference_workers=%d | model=%s | cache_ttl=%ds | cache_refresh_after=%ds",
+        "started | carparks=%d | inference_workers=%d | model=%s | detector=%s | cache_ttl=%ds | cache_refresh_after=%ds",
         len(config.carparks),
         config.inference_workers,
         config.model_path,
+        detector_mode,
         config.request_cache_ttl_s,
         config.request_cache_refresh_after_s,
     )
