@@ -50,7 +50,11 @@ class FirestoreStore:
         if client is None:
             return
         await client.collection("active_users").document(self._document_id(user_id)).set(
-            {"last_seen_at": self._server_timestamp}, merge=True
+            {
+                "user_id": user_id,
+                "last_seen_at": self._server_timestamp,
+            },
+            merge=True,
         )
 
     async def count_recent_users(self, seconds: float = 30.0) -> int:
