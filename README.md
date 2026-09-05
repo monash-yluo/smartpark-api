@@ -15,6 +15,8 @@ already deployed to Cloud Run; this platform pulls images from it).
 | CORE-API-2 | GET /api/annotate-carpark?carpark_id=.. | Annotated image (base64) |
 | OPS-API-1  | GET /api/ops/carparks | All car parks + current free spaces |
 | OPS-API-2  | GET /api/ops/users | Distinct users in the last 30 s |
+| OPS image  | GET /api/ops/carparks/{carpark_id}/image | Cached annotated image for the operator dashboard |
+| dashboard  | GET /dashboard/ | Operational dashboard |
 | probe      | GET /healthz, GET /                     | Liveness / info |
 
 OPS-REQ-1 (request logging) is handled by the middleware + app/logging_utils.py.
@@ -59,6 +61,8 @@ MODEL_PATH to the model.pt / model.onnx file.
 - TAKEPHOTO_TIMEOUT  seconds for camera calls     (default 10)
 - INFERENCE_WORKERS  YOLO thread-pool size        (default 4)
 - REQUEST_CACHE_TTL  per-car-park analysis cache TTL seconds   (default 30)
+- REQUEST_CACHE_REFRESH_AFTER  start background refresh after this cache age
+   (default 20; must be greater than 0 and less than REQUEST_CACHE_TTL)
 - FIRESTORE_DATABASE Firestore database ID (default `(default)`)
 - PORT             listen port                    (default 8000)
 
@@ -79,6 +83,8 @@ MODEL_PATH to the model.pt / model.onnx file.
    infers them concurrently (asyncio.gather), then returns the top n by free spaces.
 5. Per-car-park inference cache. A successful analysis (counts, confidence, and
    annotated image) is cached by car-park ID for the TTL, so all endpoints reuse it.
+   OPS-API-1 exposes each successful entry's `created_at` in UTC ISO 8601 format.
+   The operator image endpoint reuses the cached annotated PNG.
 6. Large n (what-if). n is clamped to the number of car parks, and at most 2*n are
    sampled, so a huge n (e.g. 200) cannot be abused to hit the cameras/replicas.
 7. Shared operational user tracking. OPS-API-2 stores active users in Firestore and
@@ -96,6 +102,23 @@ MODEL_PATH to the model.pt / model.onnx file.
    NOTE: IP is a heuristic, not a true identity — NAT sharing under-counts, mobile
    IP churn can over-count, and X-Forwarded-For should only be trusted from known
    proxies.
+9. Operational dashboard. `/dashboard/` uses the vendored Plotly.js file in
+   `app/static/plotly-2.35.2.min.js`. It polls car parks every 10 seconds and active
+   users every 5 seconds. A successful refresh displays `Refreshed at`; a later
+   failure preserves the last snapshot and marks it stale. Clicking an available
+   row opens its cached annotated image without affecting active-user statistics.
+
+## OPS-API-1 response semantics
+
+`/api/ops/carparks` returns one row for every configured car park, including failures:
+
+- `success` / HTTP 200: all rows are available.
+- `partial` / HTTP 200: available and unavailable rows are mixed.
+- `error` / HTTP 503: every configured car park is unavailable.
+
+Unavailable rows retain the car park ID and name but return `null` for
+`available_spaces`, `confidence_score`, and `created_at`. This distinguishes a
+failed camera or analysis from a car park with zero free spaces.
 
 ## Next steps
 

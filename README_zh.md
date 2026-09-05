@@ -13,6 +13,8 @@
 | CORE-API-2 | GET /api/annotate-carpark?carpark_id=.. | 返回带标注的图片（Base64） |
 | OPS-API-1  | GET /api/ops/carparks | 所有停车场及当前空闲车位数 |
 | OPS-API-2  | GET /api/ops/users | 最近 30 秒内的不重复用户 |
+| OPS 图片   | GET /api/ops/carparks/{carpark_id}/image | 运维仪表板使用的缓存标注图片 |
+| 仪表板     | GET /dashboard/ | 运维仪表板 |
 | probe      | GET /healthz、GET / | 存活状态 / 信息 |
 
 OPS-REQ-1（请求日志）由中间件和 app/logging_utils.py 处理。
@@ -54,6 +56,8 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 - TAKEPHOTO_TIMEOUT  摄像头调用的超时时间（秒）    （默认 10）
 - INFERENCE_WORKERS  YOLO 线程池大小              （默认 4）
 - REQUEST_CACHE_TTL  每个停车场分析缓存的 TTL（秒）（默认 30）
+- REQUEST_CACHE_REFRESH_AFTER  缓存达到该年龄后启动后台刷新
+   （默认 20；必须大于 0 且小于 REQUEST_CACHE_TTL）
 - PORT             监听端口                      （默认 8000）
 
 ## 关键设计决策（面试时值得说明）
@@ -62,11 +66,23 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 2. 可更新模型。模型权重**不会**复制到镜像中。在 GKE 上，initContainer 会将选定的 GCS 对象下载到共享的 `emptyDir` 卷中，应用通过 `MODEL_PATH=/data/model.pt` 读取该文件。修改 ConfigMap 中的模型 URI 并重启 Deployment 后，新 Pod 就会加载新模型，无需重新构建应用镜像。
 3. 推理不会阻塞事件循环。YOLO 是同步且 CPU 密集型的，因此会通过 `loop.run_in_executor` 在 ThreadPoolExecutor 中运行；路由只需等待其结果（见 app/inference.py）。这是核心的“瓶颈 + 缓解措施”要点。
 4. 2n 采样 + 并发执行。find-carparks 会采样 2*n 个停车场，并发拉取图片和执行推理（`asyncio.gather`），然后按空闲车位数返回前 n 个停车场。
-5. 每个停车场的推理缓存。成功的分析结果（计数、置信度和带标注图片）会按停车场 ID 缓存指定 TTL，因此所有接口都可以复用该结果。
+5. 每个停车场的推理缓存。成功的分析结果（计数、置信度和带标注图片）会按停车场 ID 缓存指定 TTL，因此所有接口都可以复用该结果。OPS-API-1 会把成功缓存条目的 `created_at` 以 UTC ISO 8601 格式返回；运维图片接口直接复用缓存中的标注 PNG。
 6. 较大的 n（假设场景）。n 会被限制为停车场数量，最多只采样 2*n 个停车场，因此巨大的 n（例如 200）不会被滥用来请求摄像头或副本。
 7. 共享的运营用户统计。OPS-API-2 将活跃用户写入 Firestore，并统计最近 30 秒内更新的文档，因此多个副本可以共享同一统计结果。如果 Firestore 被禁用或不可用，接口会返回 503，而不是报告误导性的单 Pod 统计数字。
 8. 用户身份：uuid 优先，IP 作为回退。平台需要稳定的 ID，以便将同一用户的请求归组（用于日志和 OPS-API-2 用户统计）。如果客户端提供 uuid，就使用 `user:<uuid>`；否则回退到客户端 IP（`ip:<client_ip>`），这样一个用户发起多次请求（例如多次 annotate 调用）时只会计为一个用户，而不是多个用户。原始用户 uuid 仍会在 find-carparks 响应中原样返回。在代理 / 负载均衡器（GKE Ingress、Cloud Run）后方，我们从 X-Forwarded-For 读取真实客户端地址（取最左侧的值）；否则使用直接对端地址（见 app/logging_utils.py）。
    注意：IP 只是启发式身份标识，并不是真实身份：共享 NAT 会导致统计偏低，移动网络 IP 变化可能导致统计偏高，并且只应信任来自已知代理的 X-Forwarded-For。
+9. 运维仪表板。`/dashboard/` 使用 `app/static/plotly-2.35.2.min.js` 本地 Plotly.js 文件。停车场每 10 秒刷新，活跃用户每 5 秒刷新。成功刷新显示 `Refreshed at`；之后刷新失败会保留上一次成功快照并标记 stale。点击可用停车场行会显示缓存标注图片，且不会影响活跃用户统计。
+
+## OPS-API-1 响应语义
+
+`/api/ops/carparks` 会为每个已配置停车场返回一行，包括失败的停车场：
+
+- `success` / HTTP 200：全部停车场都可用。
+- `partial` / HTTP 200：成功和不可用停车场混合。
+- `error` / HTTP 503：所有已配置停车场都不可用。
+
+不可用行仍保留停车场 ID 和名称，但 `available_spaces`、`confidence_score`、
+`created_at` 返回 `null`。这样可以区分摄像头/推理失败和“当前空位为 0”。
 
 ## 后续步骤
 

@@ -511,9 +511,72 @@ Logging 导出到可查询存储；这会增加写入量、查询复杂度和成
 - `_analyze_carpark` 现在只负责把完整分析转换为列表摘要;
     `_get_carpark_analysis` 负责缓存和 single-flight;
     `_load_and_cache_carpark_analysis` 负责实际拉图、推理和成功缓存。
-- 本次没有为 `ops_carparks` 增加「全部失败返回 503」逻辑(保持现状:返回
-  `count: 0, carparks: []`)。如需一致,可在该端点加同样判断。
+- `ops_carparks` 现在也保留所有已配置车场的状态行:全成功返回 200 + `success`,
+    部分失败返回 200 + `partial`,全部失败返回 503 + `error`。失败行保留 ID/名称,
+    并将空位、置信度和 `created_at` 返回为 `null`。
 - 缓存和 in-flight 表都是单进程/单 Pod 内存状态。不同 GKE 副本之间不能互相复用。
+
+## 15. Dashboard 与缓存分析图片
+
+> 更新日期:2026-09-05。
+
+当前运营仪表板通过 `GET /dashboard/` 提供,由 FastAPI 托管静态 HTML/CSS/JavaScript。
+Plotly.js 已固定版本并随镜像放在 `app/static/plotly-2.35.2.min.js`,不依赖公网 CDN。
+
+### Dashboard 数据与状态
+
+- `/api/ops/carparks` 每 10 秒轮询一次; `/api/ops/users` 每 5 秒轮询一次,
+    两个数据源独立降级。
+- 表格标题显示本次成功刷新时间 `Refreshed at`,不是下一次计划刷新时间。
+- 每个成功停车场的 `created_at` 来自 `TTLCache.set()` 写入时的时间戳,
+    API 以 UTC ISO 8601 返回,浏览器显示本地时间并放在 `Recorded at` 列。
+- 首次车场请求失败显示 unavailable/error;已有成功快照后刷新失败则保留旧 KPI、
+    表格和图表,并显示 `Showing stale car park data` 及最后成功更新时间。
+- 车场恢复后替换旧快照并清除 stale 状态。
+
+### 点击停车场查看分析图
+
+新增:
+
+```text
+GET /api/ops/carparks/{carpark_id}/image
+```
+
+该端点调用 `_get_carpark_analysis()` 复用同一停车场的 TTL 缓存和 single-flight 任务,
+返回缓存中的 `annotated_png` Base64、空位数和置信度。它是运维专用端点,不写入
+Firestore 用户活跃统计,因此 Dashboard 点击图片不会污染 OPS-API-2。
+
+Dashboard 只有 `available` 行可点击;点击后弹层加载图片,支持关闭和键盘 Enter/空格操作。
+关闭弹层会清除图片 `src`,避免 Base64 图片长期占用浏览器内存。
+
+### OPS-API-1 当前响应示例
+
+```json
+{
+    "status": "partial",
+    "total_carparks": 30,
+    "available_carparks": 29,
+    "unavailable_carparks": 1,
+    "carparks": [
+        {
+            "carpark_id": "CBD_001",
+            "name": "Car Park CBD_001",
+            "status": "available",
+            "available_spaces": 29,
+            "confidence_score": 0.836,
+            "created_at": "2026-09-05T07:22:15.123456+00:00"
+        },
+        {
+            "carpark_id": "CBD_002",
+            "name": "Car Park CBD_002",
+            "status": "unavailable",
+            "available_spaces": null,
+            "confidence_score": null,
+            "created_at": null
+        }
+    ]
+}
+```
 
 ## 待办/可优化
 
@@ -542,11 +605,11 @@ Logging 导出到可查询存储；这会增加写入量、查询复杂度和成
     stream 全部活跃用户；只有需要展示用户明细时才增加单独的分页查询。
 - [ ] **优先级低:** `TTLCache` 使用 `time.time()` 计算年龄，系统时间回拨或跳跃可能使
     TTL/刷新窗口不准确；若需要更稳健的本地计时，可改为 `time.monotonic()`。
-- [ ] `ops_carparks` 是否在全部停车场失败时返回 503 仍需按作业语义决定;当前保持原行为。
+- [x] `ops_carparks` 全部停车场失败时返回 503;部分失败返回 200 + `partial`,
+    且所有配置车场都有状态行。
 - [ ] 单个车场的拉图或推理失败时不会写入按停车场 ID 的分析缓存,
     因此之后的请求会重试;这是避免缓存暂时性故障的预期行为。
-- [ ] 文档同步：`README.md` 的环境变量列表尚未列出
-    `REQUEST_CACHE_REFRESH_AFTER`，应补上默认值 `20` 与约束。
+- [x] README 已列出 `REQUEST_CACHE_REFRESH_AFTER` 默认值与约束。
 
 ## 验证
 
@@ -558,9 +621,9 @@ Logging 导出到可查询存储；这会增加写入量、查询复杂度和成
 .venv\Scripts\python.exe tests\test_find_carparks_resilience.py
 ```
 
-最终结果:**13/13 passed**。测试覆盖 UUID 校验、全部相机失败、单个/全部推理失败、
+最终结果:**18/18 passed**。测试覆盖 UUID 校验、全部相机失败、单个/全部推理失败、
 部分失败、全成功、同一停车场 single-flight、不同停车场并发隔离、缓存复用、请求取消、
-优雅停机以及 refresh-ahead 后台刷新。
+优雅停机、refresh-ahead 后台刷新、OPS 三级状态、Dashboard 静态资源和缓存分析图片端点。
 
 ## 需要用到的上下文(其他 AI 会话)
 
