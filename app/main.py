@@ -288,6 +288,7 @@ async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
         return None
 
     app.state.cache.set(cache_key, analysis)
+    log.info("cache write | level=L1 | carpark=%s", carpark.id)
     if isinstance(app.state.user_activity, RedisStore):
         try:
             await app.state.user_activity.set_analysis(
@@ -295,6 +296,7 @@ async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
                 analysis,
                 app.state.config.request_cache_ttl_s,
             )
+            log.info("cache write | level=L2 | carpark=%s", carpark.id)
         except Exception as exc:  # noqa: BLE001 - shared cache is optional
             log.warning("Redis analysis cache write failed for %s: %s", carpark.id, exc)
     return analysis
@@ -341,6 +343,11 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
         cache_key, app.state.config.request_cache_refresh_after_s
     )
     if cached is not None:
+        log.info(
+            "cache hit | level=L1 | carpark=%s | refresh=%s",
+            carpark.id,
+            cached.should_refresh,
+        )
         if cached.should_refresh:
             # 缓存仍在严格 TTL 内：当前请求直接使用它；只在后台启动一个共享刷新任务。
             await _get_or_start_analysis_task(carpark)
@@ -356,6 +363,11 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
             log.warning("Redis analysis cache read failed for %s: %s", carpark.id, exc)
         else:
             if shared_cached is not None:
+                log.info(
+                    "cache hit | level=L2 | carpark=%s | refresh=%s",
+                    carpark.id,
+                    shared_cached.should_refresh,
+                )
                 if shared_cached.should_refresh:
                     await _get_or_start_analysis_task(carpark)
                 return shared_cached.value
@@ -364,10 +376,22 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
         # 等待锁时,另一个请求可能已经完成分析并写入缓存. / Another request may have completed the analysis while this request was waiting for the lock.
         cached = app.state.cache.get(cache_key)
         if cached is not None:
+            log.info(
+                "cache hit | level=L1 | carpark=%s | source=concurrent-request",
+                carpark.id,
+            )
             return cached
 
         task = app.state.inflight_analyses.get(carpark.id)
         if task is None:
+            checked_levels = (
+                "L1,L2" if isinstance(app.state.user_activity, RedisStore) else "L1"
+            )
+            log.info(
+                "cache miss | levels=%s | carpark=%s | action=inference",
+                checked_levels,
+                carpark.id,
+            )
             task = asyncio.create_task(_load_and_cache_carpark_analysis(carpark))
             app.state.inflight_analyses[carpark.id] = task
 
@@ -376,6 +400,11 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
                     del app.state.inflight_analyses[carpark.id]
 
             task.add_done_callback(remove_completed_task)
+        else:
+            log.info(
+                "cache miss | carpark=%s | action=await-inflight",
+                carpark.id,
+            )
 
     # 已取消的 HTTP 请求不能取消共享的拉图/推理任务. / A cancelled HTTP request must not cancel the shared camera/inference task.
     return await asyncio.shield(task)
