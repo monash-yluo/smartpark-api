@@ -165,6 +165,7 @@ docker build -t smartpark-api:v1 .
 docker run --rm \
    --name smartpark-api-test \
    -p 8000:8000 \
+   -e FIRESTORE_DATABASE=fit3184-a1 \
    -e MODEL_PATH=/data/model.pt \
    -v ~/smartpark-models:/data:ro \
    smartpark-api:v1
