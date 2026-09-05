@@ -63,6 +63,10 @@ MODEL_PATH to the model.pt / model.onnx file.
 - REQUEST_CACHE_TTL  per-car-park analysis cache TTL seconds   (default 30)
 - REQUEST_CACHE_REFRESH_AFTER  start background refresh after this cache age
    (default 20; must be greater than 0 and less than REQUEST_CACHE_TTL)
+- USER_ACTIVITY_STORE  shared active-user backend: `redis` or `firestore`
+   (default `firestore`, used by the GKE manifest)
+- REDIS_URL       Redis connection URL (default `redis://redis-service:6379/0`)
+- REDIS_TIMEOUT   Redis connect/read timeout seconds (default `2`)
 - FIRESTORE_DATABASE Firestore database ID (default `(default)`)
 - PORT             listen port                    (default 8000)
 
@@ -87,10 +91,11 @@ MODEL_PATH to the model.pt / model.onnx file.
    The operator image endpoint reuses the cached annotated PNG.
 6. Large n (what-if). n is clamped to the number of car parks, and at most 2*n are
    sampled, so a huge n (e.g. 200) cannot be abused to hit the cameras/replicas.
-7. Shared operational user tracking. OPS-API-2 stores active users in Firestore and
-   counts documents updated during the last 30 seconds, so the result is shared
-   across replicas. If Firestore is disabled or unavailable, the endpoint returns
-   503 rather than reporting a misleading per-pod count.
+7. Shared operational user tracking. OPS-API-2 uses a shared Redis ZSET when
+   `USER_ACTIVITY_STORE=redis`, with one member per user and the last-seen time as
+   its score. The GKE manifest runs a single in-cluster Redis Pod. Firestore remains
+   available as a fallback by setting `USER_ACTIVITY_STORE=firestore`; if the selected
+   store is unavailable, the endpoint returns 503 rather than a per-pod count.
 8. User identity: uuid with IP fallback. The platform needs a stable id so a user's
    requests group together (for logging and OPS-API-2 user counting). If the client
    supplies a uuid we use "user:<uuid>"; if not, we fall back to the client IP
@@ -134,6 +139,21 @@ Upload it to a private GCS bucket, set `MODEL_URI` in
 `storage.objects.get` (or `roles/storage.objectViewer`). The Deployment does
 not specify `serviceAccountName`; Pods use the namespace `default` ServiceAccount
 and access GCS through the node identity in the current cluster setup.
+
+### Deploy the in-cluster Redis
+
+The Redis manifest is a single non-persistent Pod for short-lived operational
+activity. It is shared by every API replica through the internal
+`redis-service:6379` Service. Redis loss can clear the 30-second activity window;
+it does not make the core APIs unavailable.
+
+```bash
+kubectl apply -f k8s/redis.yaml
+kubectl rollout status deployment/smartpark-redis
+```
+
+The API Deployment sets `USER_ACTIVITY_STORE=redis`. To fall back to Firestore,
+remove or override that variable with `firestore`, then restart the API Deployment.
 
 ### Generate the car-park ConfigMap
 

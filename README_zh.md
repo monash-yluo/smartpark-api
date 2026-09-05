@@ -58,6 +58,11 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 - REQUEST_CACHE_TTL  每个停车场分析缓存的 TTL（秒）（默认 30）
 - REQUEST_CACHE_REFRESH_AFTER  缓存达到该年龄后启动后台刷新
    （默认 20；必须大于 0 且小于 REQUEST_CACHE_TTL）
+- USER_ACTIVITY_STORE  共享用户活动后端：`redis` 或 `firestore`
+   （默认 `firestore`；GKE 清单使用 `redis`）
+- REDIS_URL       Redis 连接 URL（默认 `redis://redis-service:6379/0`）
+- REDIS_TIMEOUT   Redis 连接/读取超时秒数（默认 `2`）
+- FIRESTORE_DATABASE Firestore 数据库 ID（默认 `(default)`）
 - PORT             监听端口                      （默认 8000）
 
 ## 关键设计决策（面试时值得说明）
@@ -68,7 +73,7 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 4. 2n 采样 + 并发执行。find-carparks 会采样 2*n 个停车场，并发拉取图片和执行推理（`asyncio.gather`），然后按空闲车位数返回前 n 个停车场。
 5. 每个停车场的推理缓存。成功的分析结果（计数、置信度和带标注图片）会按停车场 ID 缓存指定 TTL，因此所有接口都可以复用该结果。OPS-API-1 会把成功缓存条目的 `created_at` 以 UTC ISO 8601 格式返回；运维图片接口直接复用缓存中的标注 PNG。
 6. 较大的 n（假设场景）。n 会被限制为停车场数量，最多只采样 2*n 个停车场，因此巨大的 n（例如 200）不会被滥用来请求摄像头或副本。
-7. 共享的运营用户统计。OPS-API-2 将活跃用户写入 Firestore，并统计最近 30 秒内更新的文档，因此多个副本可以共享同一统计结果。如果 Firestore 被禁用或不可用，接口会返回 503，而不是报告误导性的单 Pod 统计数字。
+7. 共享的运营用户统计。当 `USER_ACTIVITY_STORE=redis` 时，OPS-API-2 使用共享 Redis ZSET，以用户为 member、最后访问时间为 score。GKE 清单运行一个集群内 Redis Pod。保留 Firestore 作为回退方案：设置 `USER_ACTIVITY_STORE=firestore` 即可切回；选定的存储不可用时接口返回 503，而不是报告误导性的单 Pod 统计数字。
 8. 用户身份：uuid 优先，IP 作为回退。平台需要稳定的 ID，以便将同一用户的请求归组（用于日志和 OPS-API-2 用户统计）。如果客户端提供 uuid，就使用 `user:<uuid>`；否则回退到客户端 IP（`ip:<client_ip>`），这样一个用户发起多次请求（例如多次 annotate 调用）时只会计为一个用户，而不是多个用户。原始用户 uuid 仍会在 find-carparks 响应中原样返回。在代理 / 负载均衡器（GKE Ingress、Cloud Run）后方，我们从 X-Forwarded-For 读取真实客户端地址（取最左侧的值）；否则使用直接对端地址（见 app/logging_utils.py）。
    注意：IP 只是启发式身份标识，并不是真实身份：共享 NAT 会导致统计偏低，移动网络 IP 变化可能导致统计偏高，并且只应信任来自已知代理的 X-Forwarded-For。
 9. 运维仪表板。`/dashboard/` 使用 `app/static/plotly-2.35.2.min.js` 本地 Plotly.js 文件。停车场每 10 秒刷新，活跃用户每 5 秒刷新。成功刷新显示 `Refreshed at`；之后刷新失败会保留上一次成功快照并标记 stale。点击可用停车场行会显示缓存标注图片，且不会影响活跃用户统计。
@@ -95,6 +100,17 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 `k8s/model-configmap.yaml` 中，并授予 GKE 节点池服务账号
 `storage.objects.get`（或 `roles/storage.objectViewer`）权限。Deployment 不会指定
 `serviceAccountName`；Pod 使用命名空间 `default` 的 ServiceAccount，并通过当前集群配置中的节点身份访问 GCS。
+
+### 部署集群内 Redis
+
+Redis 清单运行一个不持久化的 Redis Pod，用于短期运营活动数据。所有 API 副本通过集群内部的 `redis-service:6379` 共享它。Redis 重启可能清空最近 30 秒的统计，但不会让核心 API 停止服务。
+
+```bash
+kubectl apply -f k8s/redis.yaml
+kubectl rollout status deployment/smartpark-redis
+```
+
+API Deployment 默认设置 `USER_ACTIVITY_STORE=redis`。如需回退到 Firestore，将该变量删除或改为 `firestore`，然后重启 API Deployment。
 
 ### 生成停车场 ConfigMap
 

@@ -3,3 +3,4 @@ uvicorn[standard]
 httpx
 pillow
 google-cloud-firestore
+redis>=5,<6

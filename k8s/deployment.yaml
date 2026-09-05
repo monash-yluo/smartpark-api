@@ -44,6 +44,10 @@ spec:
               value: /data/model.pt
             - name: CARPARKS_CONFIG
               value: /app/config/carparks.json
+            - name: USER_ACTIVITY_STORE
+              value: redis
+            - name: REDIS_URL
+              value: redis://redis-service:6379/0
             - name: FIRESTORE_ENABLED
               value: "1"
             - name: FIRESTORE_DATABASE
