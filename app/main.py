@@ -218,27 +218,43 @@ def healthz():
 @app.get("/healthz/dependencies")
 async def dependency_healthz():
     """分别检查 Redis 和 Firestore 是否已启用且可连接。"""
-    async def check_store(name: str, store) -> tuple[str, dict]:
-        if not store.enabled:
+    async def check_store(name: str, store_factory) -> tuple[str, dict]:
+        try:
+            store = store_factory()
+            enabled = store.enabled
+        except Exception as exc:  # noqa: BLE001 - report configuration/import failures per dependency
+            log.warning("dependency setup | %s failed | error=%s", name, exc)
+            return name, {
+                "status": "unavailable",
+                "available": False,
+                "error": type(exc).__name__,
+            }
+
+        if not enabled:
             return name, {"status": "disabled", "available": False}
 
         try:
             await store.check_connection()
         except Exception as exc:  # noqa: BLE001 - report each optional dependency independently
             log.warning("dependency status | %s reachable=false | error=%s", name, exc)
-            return name, {
+            result = {
                 "status": "unavailable",
                 "available": False,
                 "error": type(exc).__name__,
             }
-        finally:
-            await store.close()
+        else:
+            result = {"status": "available", "available": True}
 
-        return name, {"status": "available", "available": True}
+        try:
+            await store.close()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not break this health endpoint
+            log.warning("dependency cleanup | %s failed | error=%s", name, exc)
+
+        return name, result
 
     results = await asyncio.gather(
-        check_store("redis", RedisStore()),
-        check_store("firestore", FirestoreStore()),
+        check_store("redis", RedisStore),
+        check_store("firestore", FirestoreStore),
     )
     dependencies = dict(results)
     all_available = all(
