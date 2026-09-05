@@ -58,6 +58,8 @@ spec:
               value: "30"
             - name: REQUEST_CACHE_REFRESH_AFTER
               value: "20"
+            - name: REQUEST_CACHE_REFRESH_LOCK_TTL
+              value: "30"
           ports:
             - name: http
               containerPort: 8000

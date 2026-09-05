@@ -302,12 +302,74 @@ async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
     return analysis
 
 
-async def _get_or_start_analysis_task(carpark: CarPark) -> asyncio.Task:
+async def _refresh_carpark_analysis_with_lock(carpark: CarPark) -> dict | None:
+    """Refresh one car park only when this Pod owns its Redis refresh lock."""
+    store = app.state.user_activity
+    if not isinstance(store, RedisStore):
+        return await _load_and_cache_carpark_analysis(carpark)
+
+    try:
+        token = await store.acquire_refresh_lock(
+            carpark.id,
+            app.state.config.request_cache_refresh_lock_ttl_s,
+        )
+    except Exception as exc:  # noqa: BLE001 - refresh lock is optional
+        log.warning(
+            "Redis refresh lock failed for %s: %s; refreshing locally",
+            carpark.id,
+            exc,
+        )
+        return await _load_and_cache_carpark_analysis(carpark)
+
+    if token is None:
+        log.info(
+            "inference refresh skipped | carpark=%s | reason=lock-held",
+            carpark.id,
+        )
+        return None
+
+    try:
+        try:
+            shared_cached = await store.get_analysis(
+                carpark.id,
+                app.state.config.request_cache_refresh_after_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - lock holder can still refresh
+            log.warning(
+                "Redis refresh recheck failed for %s: %s; refreshing locally",
+                carpark.id,
+                exc,
+            )
+        else:
+            if shared_cached is not None and not shared_cached.should_refresh:
+                log.info(
+                    "inference refresh skipped | carpark=%s | reason=l2-updated",
+                    carpark.id,
+                )
+                return shared_cached.value
+
+        log.info("inference refresh started | carpark=%s", carpark.id)
+        return await _load_and_cache_carpark_analysis(carpark)
+    finally:
+        try:
+            await store.release_refresh_lock(carpark.id, token)
+        except Exception as exc:  # noqa: BLE001 - lock cleanup is best effort
+            log.warning("Redis refresh lock release failed for %s: %s", carpark.id, exc)
+
+
+async def _get_or_start_analysis_task(
+    carpark: CarPark, *, refresh: bool = False
+) -> asyncio.Task:
     """返回指定车场正在运行的共享任务；没有时创建并登记一个任务。"""
     async with app.state.inflight_analyses_lock:
         task = app.state.inflight_analyses.get(carpark.id)
         if task is None:
-            task = asyncio.create_task(_load_and_cache_carpark_analysis(carpark))
+            task_runner = (
+                _refresh_carpark_analysis_with_lock
+                if refresh
+                else _load_and_cache_carpark_analysis
+            )
+            task = asyncio.create_task(task_runner(carpark))
             app.state.inflight_analyses[carpark.id] = task
 
             def remove_completed_task(completed_task: asyncio.Task) -> None:
@@ -350,7 +412,7 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
         )
         if cached.should_refresh:
             # 缓存仍在严格 TTL 内：当前请求直接使用它；只在后台启动一个共享刷新任务。
-            await _get_or_start_analysis_task(carpark)
+            await _get_or_start_analysis_task(carpark, refresh=True)
         return cached.value
 
     if isinstance(app.state.user_activity, RedisStore):
@@ -369,7 +431,7 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
                     shared_cached.should_refresh,
                 )
                 if shared_cached.should_refresh:
-                    await _get_or_start_analysis_task(carpark)
+                    await _get_or_start_analysis_task(carpark, refresh=True)
                 return shared_cached.value
 
     async with app.state.inflight_analyses_lock:

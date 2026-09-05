@@ -1,9 +1,56 @@
-# Handoff: API 韧性、按停车场缓存与 Single-Flight
+# Handoff: API 韧性、两级缓存与 Refresh Lock
 
 > 供后续 AI 会话/开发者快速接手的交接文档。
 > 对象文件:`app/main.py`、`app/firestore_store.py`、`app/logging_utils.py`、
 > `k8s/deployment.yaml`
-> 更新日期:2026-09-05
+> 更新日期:2026-09-06
+
+## 当前实现摘要
+
+当前代码已经实现按配置切换的用户活动后端和条件式两级分析缓存：
+
+- `USER_ACTIVITY_STORE=redis`：活跃用户统计使用 Redis ZSET；分析缓存读取顺序为
+    L1 本地 `TTLCache` -> L2 Redis -> 摄像头/推理。推理成功后双写 L1/L2。
+- `USER_ACTIVITY_STORE=firestore`：保留 Firestore 用户统计；分析缓存只使用原来的
+    L1，不访问 Redis，保证回退行为与之前一致。
+- L1/L2 TTL 都使用 `REQUEST_CACHE_TTL`，默认 30 秒；L2 命中不回填 L1，避免
+    Redis 命中后重新获得一个完整 L1 TTL、意外延长数据年龄。
+- `REQUEST_CACHE_REFRESH_AFTER` 默认 20 秒。进入刷新窗口时立即返回当前数据，并
+    尝试后台刷新；超过 TTL 的数据不返回。
+- Redis 模式下，后台刷新使用每个停车场的 token-safe Redis lock，锁 TTL 由
+    `REQUEST_CACHE_REFRESH_LOCK_TTL` 控制，默认 30 秒。拿不到锁的 Pod 跳过刷新；
+    拿到锁后会再次检查 L2，若已有新值则跳过 YOLO。L1/L2 同时冷 miss 暂不加锁，
+    因此冷启动窗口仍可能出现跨 Pod 重复推理。
+- Redis 故障时，核心 API 继续走本地推理并保留 L1；Redis 写入/读取失败只记录
+    warning。活跃用户统计接口在选定共享后端不可用时返回 503。
+
+相关文件：`app/main.py`、`app/cache.py`、`app/redis_store.py`、
+`app/user_activity_store.py`、`app/firestore_store.py`、`app/config.py`、
+`k8s/redis.yaml`、`k8s/deployment.yaml`。
+
+缓存观测日志包括：`cache hit | level=L1/L2`、`cache miss`、`cache write`、
+`inference refresh started`、`inference refresh skipped | reason=lock-held` 和
+`reason=l2-updated`。README 中的 Cache statistics 命令按 Pod 统计这些事件。
+
+### Redis/Firestore 切换与部署边界
+
+- `app/user_activity_store.py` 根据 `USER_ACTIVITY_STORE` 构造后端；代码默认值是
+    `firestore`，当前 `k8s/deployment.yaml` 显式设置为 `redis`。切回 Firestore 只需将
+    环境变量改为 `firestore` 并滚动重启 API，Firestore 实现和依赖均保留。
+- Redis 活跃用户使用 `smartpark:active-users` ZSET，member 是稳定用户 ID，score 是
+    Redis 服务端时间；`/api/ops/users` 原子清理 30 秒窗口外成员并返回 `ZCARD`。
+- `k8s/redis.yaml` 是单副本 Redis Deployment + ClusterIP `redis-service:6379`，因此
+    API Pod 即使跨 Node 也通过 Kubernetes DNS/CNI 访问同一实例。Redis 不应作为 API
+    sidecar，否则每个 Pod 仍是独立状态。
+- Redis 当前关闭 RDB/AOF，重启会丢失 30 秒活跃用户和 L2 分析缓存；这些数据可重建，
+    但单 Redis Pod 仍是共享遥测和 L2 的单点故障。核心 API 对 Redis 缓存故障会降级，
+    `/api/ops/users` 在 Redis 后端不可用时返回 503。
+- API `/healthz` 只用于自身 liveness/readiness，不依赖 Redis，避免 Redis 故障把所有
+    API Pod 从 Service 摘除。`/healthz/dependencies` 独立报告 Redis 和 Firestore 状态。
+- 当前 `k8s/redis.yaml` 的 Pod memory limit 是 4 GiB，但 Redis 启动参数仍为
+    `--maxmemory 128mb`；图片 L2 实际最多使用约 128 MB，并由 `allkeys-lru` 淘汰。
+    `allkeys-lru` 也可能淘汰活跃用户 ZSET。后续若图片大小/基数需要更多容量，应明确
+    调整 `--maxmemory`，而不能只提高 Kubernetes memory limit。
 
 ## 背景
 
@@ -590,14 +637,15 @@ Dashboard 只有 `available` 行可点击;点击后弹层加载图片,支持关�
 - [ ] **优先级中:** 给 refresh-ahead 加入失败后的重试节流/退避。当前刷新失败不会覆盖旧缓存，
     这是正确的；但在 20-30 秒窗口内，每次后续命中都可能再次触发一次刷新，故障相机可能产生
     额外请求。
-- [ ] **优先级中:** 若需要跨副本去重,使用 Redis 等共享组件实现分布式锁/结果缓存;
-    当前 `asyncio.Lock` 只在单个进程内有效。
+- [x] Redis L2 已实现跨 Pod 结果缓存；token-safe Redis lock 已实现跨 Pod 后台
+    refresh 去重。当前 `asyncio.Lock` 仍负责单 Pod 内 single-flight；冷 L1/L2 miss
+    尚未使用分布式锁，这是有意控制复杂度的当前边界。
 - [ ] **优先级中:** 给按停车场缓存增加容量上限或定期清理策略。当前 TTLCache 只在
     读取过期键时惰性删除,大量停车场 ID 变化时可能积累过期条目。
 - [ ] **优先级中:** 评估缓存的“按停车场 ID”粒度与实时性要求。如果必须识别画面变化,
     可每次拉图后按图片哈希缓存推理结果,但这样不能省掉相机请求。
-- [ ] **优先级低:** 可以给缓存命中/未命中、single-flight 等待、推理耗时增加指标,
-    便于 Locust 和 GKE 压测判断优化是否有效。
+- [x] 已增加 L1/L2 hit、miss、write、await-inflight、refresh started/skipped 日志，
+    README 已提供按 Pod 汇总的 Bash/AWK 命令。仍可进一步增加真实推理耗时指标。
 - [ ] **优先级低:** 先用 Locust 对比 Firestore 写入开启前后的 P95 延迟和 QPS；如果
     Firestore 写入成为瓶颈，再考虑同一 Pod 内按 user ID 做 3-5 秒写入节流。节流只减少
     重复写入，不改变 30 秒 distinct-user 的语义，但会让 `last_seen_at` 有少量更新延迟。
@@ -610,6 +658,35 @@ Dashboard 只有 `available` 行可点击;点击后弹层加载图片,支持关�
 - [ ] 单个车场的拉图或推理失败时不会写入按停车场 ID 的分析缓存,
     因此之后的请求会重试;这是避免缓存暂时性故障的预期行为。
 - [x] README 已列出 `REQUEST_CACHE_REFRESH_AFTER` 默认值与约束。
+- [ ] 用真实 GKE 压测验证 `REQUEST_CACHE_REFRESH_LOCK_TTL=30` 是否覆盖最慢的
+    摄像头拉取 + YOLO refresh。当前请求 P95 约 15 秒，30 秒是初始保守值；如果同一
+    车场在 30 秒内仍出现多个 `inference refresh started`，应提高锁 TTL 或实现续租。
+
+## 2026-09-06 两 Pod 缓存观测
+
+一次压测日志按 Pod 的结果：
+
+```text
+Pod kdsgt: L1 hit 16180, L2 hit 605, miss 103,
+           L1 refresh 2266, L2 refresh 139, L1/L2 write 各 341,
+           L1 hit rate 95.81%, L2 hit rate 3.58%, total 99.39%
+Pod sdf7c: L1 hit 17866, L2 hit 144, miss 339,
+           L1 refresh 2644, L2 refresh 7, L1/L2 write 各 361,
+           L1 hit rate 97.37%, L2 hit rate 0.78%, total 98.15%
+```
+
+聚合后 L1 hit 34,046、L2 hit 749、miss 442，总命中率约 98.75%。L1 是稳定流量的
+主要命中层，L2 的价值是避免当前 Pod 在本地冷缓存时进入摄像头/YOLO 路径。大量
+`refresh=True` 表明即使 miss 比例低，多个 Pod 仍可能同时启动 CPU 密集型后台刷新；
+这正是加入 refresh lock 的原因。不要把 miss 数直接等同于推理次数，同 Pod 的
+single-flight 会让部分请求等待同一个任务。
+
+部署新 refresh-lock 版本后，应使用 README 的脚本比较：
+
+- `Refresh started`：实际获得锁并需要刷新；
+- `Skipped lock-held`：另一个 Pod 正在刷新，当前 Pod 节省一次后台推理；
+- `Skipped L2-updated`：获得锁后发现其他 Pod 已更新 L2，当前 Pod节省一次后台推理；
+- Locust RPS、平均延迟、P95/P99、失败率，以及 `kubectl top pods` CPU。
 
 ## 验证
 
@@ -624,6 +701,17 @@ Dashboard 只有 `available` 行可点击;点击后弹层加载图片,支持关�
 最终结果:**18/18 passed**。测试覆盖 UUID 校验、全部相机失败、单个/全部推理失败、
 部分失败、全成功、同一停车场 single-flight、不同停车场并发隔离、缓存复用、请求取消、
 优雅停机、refresh-ahead 后台刷新、OPS 三级状态、Dashboard 静态资源和缓存分析图片端点。
+
+Redis/L2/refresh-lock 聚焦测试命令：
+
+```powershell
+.venv\Scripts\python.exe tests\test_redis_analysis_cache.py -v
+```
+
+最终结果：**9/9 passed**。覆盖 L2 序列化和 TTL、L2 hit 不回填 L1、OPS 在
+L1 miss/L2 hit 时保留 `created_at`、L2 miss 后双写、Firestore 模式 L1-only、
+Redis lock 的 `NX + EX` 互斥与 token-safe 释放、lock-held 跳过、L2 已更新跳过，
+以及锁拥有者执行一次刷新并释放锁。
 
 ## 需要用到的上下文(其他 AI 会话)
 

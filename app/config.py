@@ -57,6 +57,7 @@ class PlatformConfig:
     inference_workers: int = 4
     request_cache_ttl_s: int = 30
     request_cache_refresh_after_s: int = 20
+    request_cache_refresh_lock_ttl_s: int = 30
 
     def carpark_by_id(self, carpark_id: str) -> CarPark | None:
         # Look up a single car park by its id. 按 id 查找单个车场.
@@ -106,11 +107,16 @@ def load_platform_config() -> PlatformConfig:
     request_cache_refresh_after_s = int(
         os.getenv("REQUEST_CACHE_REFRESH_AFTER", "20")
     )
+    request_cache_refresh_lock_ttl_s = int(
+        os.getenv("REQUEST_CACHE_REFRESH_LOCK_TTL", "30")
+    )
     if not 0 < request_cache_refresh_after_s < request_cache_ttl_s:
         raise ValueError(
             "REQUEST_CACHE_REFRESH_AFTER must be greater than 0 and less than "
             "REQUEST_CACHE_TTL"
         )
+    if request_cache_refresh_lock_ttl_s <= 0:
+        raise ValueError("REQUEST_CACHE_REFRESH_LOCK_TTL must be greater than 0")
 
     return PlatformConfig(
         carparks=carparks,
@@ -119,4 +125,5 @@ def load_platform_config() -> PlatformConfig:
         inference_workers=max(1, int(os.getenv("INFERENCE_WORKERS", "4"))),
         request_cache_ttl_s=request_cache_ttl_s,
         request_cache_refresh_after_s=request_cache_refresh_after_s,
+        request_cache_refresh_lock_ttl_s=request_cache_refresh_lock_ttl_s,
     )

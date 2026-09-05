@@ -58,6 +58,7 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 - REQUEST_CACHE_TTL  每个停车场分析缓存的 TTL（秒）（默认 30）
 - REQUEST_CACHE_REFRESH_AFTER  缓存达到该年龄后启动后台刷新
    （默认 20；必须大于 0 且小于 REQUEST_CACHE_TTL）
+- REQUEST_CACHE_REFRESH_LOCK_TTL  Redis 刷新锁 TTL（秒，默认 30；应高于摄像头拉取与推理的预计总耗时）
 - USER_ACTIVITY_STORE  共享用户活动后端：`redis` 或 `firestore`
    （默认 `firestore`；GKE 清单使用 `redis`）
 - REDIS_URL       Redis 连接 URL（默认 `redis://redis-service:6379/0`）
@@ -71,12 +72,18 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 2. 可更新模型。模型权重**不会**复制到镜像中。在 GKE 上，initContainer 会将选定的 GCS 对象下载到共享的 `emptyDir` 卷中，应用通过 `MODEL_PATH=/data/model.pt` 读取该文件。修改 ConfigMap 中的模型 URI 并重启 Deployment 后，新 Pod 就会加载新模型，无需重新构建应用镜像。
 3. 推理不会阻塞事件循环。YOLO 是同步且 CPU 密集型的，因此会通过 `loop.run_in_executor` 在 ThreadPoolExecutor 中运行；路由只需等待其结果（见 app/inference.py）。这是核心的“瓶颈 + 缓解措施”要点。
 4. 2n 采样 + 并发执行。find-carparks 会采样 2*n 个停车场，并发拉取图片和执行推理（`asyncio.gather`），然后按空闲车位数返回前 n 个停车场。
-5. 每个停车场的推理缓存。成功的分析结果（计数、置信度和带标注图片）会按停车场 ID 缓存指定 TTL，因此所有接口都可以复用该结果。OPS-API-1 会把成功缓存条目的 `created_at` 以 UTC ISO 8601 格式返回；运维图片接口直接复用缓存中的标注 PNG。选择 Redis 用户活动后端时，Redis 同时作为所有 Pod 共享的 L2 分析缓存：读取顺序为本地 L1、Redis L2、推理，推理成功后以相同 TTL 双写 L1 和 L2。L2 命中直接返回而不回填或续期 L1。选择 Firestore 后端时仍只使用原有 L1 缓存。
+5. 每个停车场的推理缓存。成功的分析结果（计数、置信度和带标注图片）会按停车场 ID 缓存指定 TTL，因此所有接口都可以复用该结果。OPS-API-1 会把成功缓存条目的 `created_at` 以 UTC ISO 8601 格式返回；运维图片接口直接复用缓存中的标注 PNG。选择 Redis 用户活动后端时，Redis 同时作为所有 Pod 共享的 L2 分析缓存：读取顺序为本地 L1、Redis L2、推理，推理成功后以相同 TTL 双写 L1 和 L2。L2 命中直接返回而不回填或续期 L1。后台刷新使用每个停车场一把带 token 的 Redis 锁协调；没有拿到锁的 Pod 直接返回当前缓存而不启动 YOLO，锁持有者在推理前再次检查 L2，避免其他 Pod 已完成刷新后重复推理。冷的 L1/L2 同时 miss 仍不加锁，偶尔可能并发推理。选择 Firestore 后端时仍只使用原有 L1 缓存。
 6. 较大的 n（假设场景）。n 会被限制为停车场数量，最多只采样 2*n 个停车场，因此巨大的 n（例如 200）不会被滥用来请求摄像头或副本。
 7. 共享的运营用户统计。当 `USER_ACTIVITY_STORE=redis` 时，OPS-API-2 使用共享 Redis ZSET，以用户为 member、最后访问时间为 score。GKE 清单运行一个集群内 Redis Pod。保留 Firestore 作为回退方案：设置 `USER_ACTIVITY_STORE=firestore` 即可切回；选定的存储不可用时接口返回 503，而不是报告误导性的单 Pod 统计数字。
 8. 用户身份：uuid 优先，IP 作为回退。平台需要稳定的 ID，以便将同一用户的请求归组（用于日志和 OPS-API-2 用户统计）。如果客户端提供 uuid，就使用 `user:<uuid>`；否则回退到客户端 IP（`ip:<client_ip>`），这样一个用户发起多次请求（例如多次 annotate 调用）时只会计为一个用户，而不是多个用户。原始用户 uuid 仍会在 find-carparks 响应中原样返回。在代理 / 负载均衡器（GKE Ingress、Cloud Run）后方，我们从 X-Forwarded-For 读取真实客户端地址（取最左侧的值）；否则使用直接对端地址（见 app/logging_utils.py）。
    注意：IP 只是启发式身份标识，并不是真实身份：共享 NAT 会导致统计偏低，移动网络 IP 变化可能导致统计偏高，并且只应信任来自已知代理的 X-Forwarded-For。
 9. 运维仪表板。`/dashboard/` 使用 `app/static/plotly-2.35.2.min.js` 本地 Plotly.js 文件。停车场每 10 秒刷新，活跃用户每 5 秒刷新。成功刷新显示 `Refreshed at`；之后刷新失败会保留上一次成功快照并标记 stale。点击可用停车场行会显示缓存标注图片，且不会影响活跃用户统计。
+
+   缓存和 refresh lock 总结：
+   - L1 是每个 Pod 的本地内存 `TTLCache`；只有当 `USER_ACTIVITY_STORE=redis` 时才启用共享 Redis L2。
+   - 两级缓存都使用 `REQUEST_CACHE_TTL`（默认 30 秒）。L2 命中直接返回，不回填 L1，因此不会因为 L2 命中而延长原始缓存生命周期。
+   - 缓存达到 `REQUEST_CACHE_REFRESH_AFTER`（默认 20 秒）后，当前请求立即返回仍有效的旧数据，同时尝试后台刷新。
+   - Redis 模式使用 `REQUEST_CACHE_REFRESH_LOCK_TTL`（默认 30 秒）和每个停车场一把带 token 的锁，避免多个 Pod 重复后台刷新。Firestore 模式不会访问 Redis，仍保持原来的 L1-only 行为。
 
 ## 在 GKE 上统计缓存
 
@@ -102,6 +109,9 @@ for pod in $(kubectl get pods -l app=smartpark-api \
          /cache miss/                { miss++; next }
          /cache write.*level=L1/     { l1_write++; next }
          /cache write.*level=L2/     { l2_write++; next }
+         /inference refresh started/ { refresh_started++; next }
+         /inference refresh skipped.*reason=lock-held/ { lock_held++; next }
+         /inference refresh skipped.*reason=l2-updated/ { l2_updated++; next }
          END {
             hits = l1_hit + l2_hit
             total = hits + miss
@@ -112,6 +122,9 @@ for pod in $(kubectl get pods -l app=smartpark-api \
             printf "%-15s %d\n", "L2 refresh", l2_refresh + 0
             printf "%-15s %d\n", "L1 write", l1_write + 0
             printf "%-15s %d\n", "L2 write", l2_write + 0
+            printf "%-15s %d\n", "Refresh started", refresh_started + 0
+            printf "%-15s %d\n", "Skipped lock-held", lock_held + 0
+            printf "%-15s %d\n", "Skipped L2-updated", l2_updated + 0
             if (total > 0) {
                printf "%-15s %.2f%%\n", "L1 hit rate", 100 * l1_hit / total
                printf "%-15s %.2f%%\n", "L2 hit rate", 100 * l2_hit / total
@@ -123,6 +136,16 @@ done
 ```
 
 命中率的分母是 `L1 命中 + L2 命中 + miss`。缓存写入单独统计，不重复算作命中。`refresh=True` 表示当前请求会立即返回现有缓存，同时启动后台刷新。`kubectl logs` 读取当前容器保存的日志，因此比较不同 Pod 时应使用相同的压测时间窗口，并注意 Pod 重启会重置日志和 L1 缓存。
+
+使用以下命令观察各 Pod 的 refresh lock 决策：
+
+```bash
+kubectl logs -l app=smartpark-api -c smartpark-api \
+   --prefix --tail=-1 --max-log-requests=10 |
+   grep -E 'inference refresh (started|skipped)'
+```
+
+`reason=lock-held` 表示另一个 Pod 正持有刷新锁；`reason=l2-updated` 表示当前 Pod 拿到锁后发现 L2 已被更新，因此跳过重复 YOLO。GKE 清单当前将锁 TTL 设置为 30 秒，约为已观察到的 15 秒 P95 的两倍；如果日志显示刷新经常超过锁的生命周期，应继续提高该值。
 
 ## OPS-API-1 响应语义
 

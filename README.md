@@ -63,6 +63,8 @@ MODEL_PATH to the model.pt / model.onnx file.
 - REQUEST_CACHE_TTL  per-car-park analysis cache TTL seconds   (default 30)
 - REQUEST_CACHE_REFRESH_AFTER  start background refresh after this cache age
    (default 20; must be greater than 0 and less than REQUEST_CACHE_TTL)
+- REQUEST_CACHE_REFRESH_LOCK_TTL  Redis refresh-lock TTL seconds (default 30;
+   set above the expected camera-fetch plus inference duration)
 - USER_ACTIVITY_STORE  shared active-user backend: `redis` or `firestore`
    (default `firestore`, used by the GKE manifest)
 - REDIS_URL       Redis connection URL (default `redis://redis-service:6379/0`)
@@ -92,7 +94,11 @@ MODEL_PATH to the model.pt / model.onnx file.
    selected activity backend, Redis also acts as an L2 analysis cache shared by all
    Pods: reads check local L1 first and then Redis, while inference writes both with
    the same TTL. An L2 hit is returned without extending or backfilling L1. With the
-   Firestore backend, analysis caching remains local-only as before.
+   Firestore backend, analysis caching remains local-only as before. Redis mode also
+   coordinates background refreshes with one token-safe lock per car park. A Pod
+   that does not acquire the lock returns the current cache without starting YOLO;
+   the owner rechecks L2 before inference in case another Pod already refreshed it.
+   Cold L1/L2 misses remain unlocked and can occasionally infer concurrently.
 6. Large n (what-if). n is clamped to the number of car parks, and at most 2*n are
    sampled, so a huge n (e.g. 200) cannot be abused to hit the cameras/replicas.
 7. Shared operational user tracking. OPS-API-2 uses a shared Redis ZSET when
@@ -116,6 +122,19 @@ MODEL_PATH to the model.pt / model.onnx file.
    users every 5 seconds. A successful refresh displays `Refreshed at`; a later
    failure preserves the last snapshot and marks it stale. Clicking an available
    row opens its cached annotated image without affecting active-user statistics.
+
+    Cache and refresh-lock summary:
+    - L1 is the per-Pod in-memory `TTLCache`; L2 is Redis only when
+       `USER_ACTIVITY_STORE=redis`.
+    - Both cache levels use `REQUEST_CACHE_TTL` (default 30 seconds). A Redis hit is
+       returned directly and is never copied back into L1, so a hit cannot extend the
+       original cache lifetime.
+    - At `REQUEST_CACHE_REFRESH_AFTER` (default 20 seconds), stale-but-valid data is
+       returned immediately while a background refresh is attempted.
+    - Redis mode uses `REQUEST_CACHE_REFRESH_LOCK_TTL` (default 30 seconds) and a
+       token-safe per-car-park lock to prevent duplicate background refreshes across
+       Pods. Firestore mode does not contact Redis and keeps the original L1-only
+       behavior.
 
 ## Cache statistics on GKE
 
@@ -143,6 +162,9 @@ for pod in $(kubectl get pods -l app=smartpark-api \
          /cache miss/                { miss++; next }
          /cache write.*level=L1/     { l1_write++; next }
          /cache write.*level=L2/     { l2_write++; next }
+         /inference refresh started/ { refresh_started++; next }
+         /inference refresh skipped.*reason=lock-held/ { lock_held++; next }
+         /inference refresh skipped.*reason=l2-updated/ { l2_updated++; next }
          END {
             hits = l1_hit + l2_hit
             total = hits + miss
@@ -153,6 +175,9 @@ for pod in $(kubectl get pods -l app=smartpark-api \
             printf "%-15s %d\n", "L2 refresh", l2_refresh + 0
             printf "%-15s %d\n", "L1 write", l1_write + 0
             printf "%-15s %d\n", "L2 write", l2_write + 0
+            printf "%-15s %d\n", "Refresh started", refresh_started + 0
+            printf "%-15s %d\n", "Skipped lock-held", lock_held + 0
+            printf "%-15s %d\n", "Skipped L2-updated", l2_updated + 0
             if (total > 0) {
                printf "%-15s %.2f%%\n", "L1 hit rate", 100 * l1_hit / total
                printf "%-15s %.2f%%\n", "L2 hit rate", 100 * l2_hit / total
@@ -168,6 +193,19 @@ separately and are not counted as hits. A refresh hit returns the current value
 immediately and also starts a background refresh. Because `kubectl logs` reads
 the current container log, compare Pods over the same test window and account
 for Pod restarts when interpreting the totals.
+
+To observe refresh-lock decisions across Pods:
+
+```bash
+kubectl logs -l app=smartpark-api -c smartpark-api \
+   --prefix --tail=-1 --max-log-requests=10 |
+   grep -E 'inference refresh (started|skipped)'
+```
+
+`reason=lock-held` means another Pod owns the refresh. `reason=l2-updated` means
+this Pod acquired the lock but found a newer L2 value and avoided redundant YOLO.
+The GKE manifest uses a 30-second lock TTL, twice the observed approximate 15-second
+P95 response time. Increase it if logs show a refresh regularly outliving its lock.
 
 ## OPS-API-1 response semantics
 

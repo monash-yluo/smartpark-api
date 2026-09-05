@@ -14,7 +14,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.cache import CacheLookup, TTLCache
 from app.config import CarPark
 from app.firestore_store import FirestoreStore
-from app.main import _get_carpark_analysis, app, ops_carparks
+from app.main import (
+    _get_carpark_analysis,
+    _refresh_carpark_analysis_with_lock,
+    app,
+    ops_carparks,
+)
 from app.redis_store import RedisStore
 
 
@@ -23,15 +28,43 @@ class _FakeRedisClient:
         self.values = {}
         self.last_expiry = None
 
-    async def set(self, key, value, ex):
+    async def set(self, key, value, ex, nx=False):
+        if nx and key in self.values:
+            return None
         self.values[key] = value
         self.last_expiry = ex
+        return True
 
     async def get(self, key):
         return self.values.get(key)
 
+    async def eval(self, script, key_count, key, token):
+        del script, key_count
+        if self.values.get(key) != token:
+            return 0
+        del self.values[key]
+        return 1
+
 
 class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_lock_is_exclusive_and_token_safe(self):
+        store = RedisStore()
+        client = _FakeRedisClient()
+        store._client = client
+
+        owner_token = await store.acquire_refresh_lock("CBD_001", 30)
+        competing_token = await store.acquire_refresh_lock("CBD_001", 30)
+
+        self.assertIsNotNone(owner_token)
+        self.assertIsNone(competing_token)
+        self.assertEqual(client.last_expiry, 30)
+        self.assertFalse(
+            await store.release_refresh_lock("CBD_001", "wrong-token")
+        )
+        self.assertTrue(
+            await store.release_refresh_lock("CBD_001", owner_token)
+        )
+
     async def test_analysis_round_trip_uses_requested_ttl(self):
         store = RedisStore()
         client = _FakeRedisClient()
@@ -132,6 +165,7 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         app.state.config = SimpleNamespace(
             request_cache_refresh_after_s=20,
             request_cache_ttl_s=30,
+            request_cache_refresh_lock_ttl_s=30,
             takephoto_timeout_s=1,
         )
         app.state.inflight_analyses = {}
@@ -148,6 +182,82 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         )
         store.get_analysis.assert_awaited_once_with(carpark.id, 20)
         store.set_analysis.assert_awaited_once_with(carpark.id, analysis, 30)
+
+    async def test_refresh_skips_inference_when_lock_is_held(self):
+        carpark = CarPark("CBD_005", "Five", "http://camera")
+        store = RedisStore()
+        store.acquire_refresh_lock = AsyncMock(return_value=None)
+        store.release_refresh_lock = AsyncMock()
+        app.state.user_activity = store
+        app.state.config = SimpleNamespace(request_cache_refresh_lock_ttl_s=30)
+
+        with patch(
+            "app.main._load_and_cache_carpark_analysis", AsyncMock()
+        ) as load_analysis:
+            result = await _refresh_carpark_analysis_with_lock(carpark)
+
+        self.assertIsNone(result)
+        store.acquire_refresh_lock.assert_awaited_once_with(carpark.id, 30)
+        store.release_refresh_lock.assert_not_awaited()
+        load_analysis.assert_not_awaited()
+
+    async def test_refresh_skips_inference_when_l2_was_updated(self):
+        carpark = CarPark("CBD_006", "Six", "http://camera")
+        refreshed = {
+            "available_spaces": 10,
+            "occupied_spaces": 1,
+            "confidence_score": 0.96,
+            "annotated_png": b"updated",
+        }
+        store = RedisStore()
+        store.acquire_refresh_lock = AsyncMock(return_value="owner-token")
+        store.release_refresh_lock = AsyncMock(return_value=True)
+        store.get_analysis = AsyncMock(
+            return_value=CacheLookup(refreshed, should_refresh=False)
+        )
+        app.state.user_activity = store
+        app.state.config = SimpleNamespace(
+            request_cache_refresh_after_s=20,
+            request_cache_refresh_lock_ttl_s=30,
+        )
+
+        with patch(
+            "app.main._load_and_cache_carpark_analysis", AsyncMock()
+        ) as load_analysis:
+            result = await _refresh_carpark_analysis_with_lock(carpark)
+
+        self.assertEqual(result, refreshed)
+        load_analysis.assert_not_awaited()
+        store.release_refresh_lock.assert_awaited_once_with(
+            carpark.id, "owner-token"
+        )
+
+    async def test_refresh_owner_runs_inference_and_releases_lock(self):
+        carpark = CarPark("CBD_007", "Seven", "http://camera")
+        refreshed = {"available_spaces": 6}
+        store = RedisStore()
+        store.acquire_refresh_lock = AsyncMock(return_value="owner-token")
+        store.release_refresh_lock = AsyncMock(return_value=True)
+        store.get_analysis = AsyncMock(
+            return_value=CacheLookup({}, should_refresh=True)
+        )
+        app.state.user_activity = store
+        app.state.config = SimpleNamespace(
+            request_cache_refresh_after_s=20,
+            request_cache_refresh_lock_ttl_s=30,
+        )
+
+        with patch(
+            "app.main._load_and_cache_carpark_analysis",
+            AsyncMock(return_value=refreshed),
+        ) as load_analysis:
+            result = await _refresh_carpark_analysis_with_lock(carpark)
+
+        self.assertEqual(result, refreshed)
+        load_analysis.assert_awaited_once_with(carpark)
+        store.release_refresh_lock.assert_awaited_once_with(
+            carpark.id, "owner-token"
+        )
 
     async def test_firestore_mode_uses_only_l1_and_inference(self):
         carpark = CarPark("CBD_002", "Two", "http://camera")

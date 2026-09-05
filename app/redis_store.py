@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import time
+import uuid
 
 from .cache import CacheLookup
 
@@ -15,6 +16,13 @@ class RedisStore:
 
     _KEY = "smartpark:active-users"
     _ANALYSIS_KEY_PREFIX = "smartpark:analysis:"
+    _REFRESH_LOCK_KEY_PREFIX = "smartpark:analysis-refresh-lock:"
+    _RELEASE_LOCK_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
     _COUNT_SCRIPT = """
 local now = redis.call('TIME')
 local now_ms = now[1] * 1000 + math.floor(now[2] / 1000)
@@ -110,6 +118,27 @@ return redis.call('ZCARD', KEYS[1])
             value=analysis,
             should_refresh=time.time() - created_at >= refresh_after_s,
         )
+
+    async def acquire_refresh_lock(
+        self, carpark_id: str, ttl_s: int
+    ) -> str | None:
+        token = uuid.uuid4().hex
+        acquired = await self._get_client().set(
+            f"{self._REFRESH_LOCK_KEY_PREFIX}{carpark_id}",
+            token,
+            nx=True,
+            ex=ttl_s,
+        )
+        return token if acquired else None
+
+    async def release_refresh_lock(self, carpark_id: str, token: str) -> bool:
+        released = await self._get_client().eval(
+            self._RELEASE_LOCK_SCRIPT,
+            1,
+            f"{self._REFRESH_LOCK_KEY_PREFIX}{carpark_id}",
+            token,
+        )
+        return bool(released)
 
     async def close(self) -> None:
         if self._client is not None:
