@@ -44,8 +44,10 @@ from fastapi.staticfiles import StaticFiles
 from .cache import TTLCache
 from .config import CarPark, load_platform_config
 from .dashboard import router as dashboard_router
+from .firestore_store import FirestoreStore
 from .inference import Detector, build_detector
 from .user_activity_store import build_user_activity_store
+from .redis_store import RedisStore
 from .logging_utils import (
     build_user_id,
     current_uuid,
@@ -211,6 +213,41 @@ def healthz():
     """Liveness/readiness probe for GKE.
     GKE 的存活/就绪探针。"""
     return {"status": "ok"}
+
+
+@app.get("/healthz/dependencies")
+async def dependency_healthz():
+    """分别检查 Redis 和 Firestore 是否已启用且可连接。"""
+    async def check_store(name: str, store) -> tuple[str, dict]:
+        if not store.enabled:
+            return name, {"status": "disabled", "available": False}
+
+        try:
+            await store.check_connection()
+        except Exception as exc:  # noqa: BLE001 - report each optional dependency independently
+            log.warning("dependency status | %s reachable=false | error=%s", name, exc)
+            return name, {
+                "status": "unavailable",
+                "available": False,
+                "error": type(exc).__name__,
+            }
+        finally:
+            await store.close()
+
+        return name, {"status": "available", "available": True}
+
+    results = await asyncio.gather(
+        check_store("redis", RedisStore()),
+        check_store("firestore", FirestoreStore()),
+    )
+    dependencies = dict(results)
+    all_available = all(
+        dependency["available"] for dependency in dependencies.values()
+    )
+    return {
+        "status": "ok" if all_available else "degraded",
+        "dependencies": dependencies,
+    }
 
 
 # ---------------------------------------------------------------------------
