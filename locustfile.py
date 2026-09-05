@@ -8,8 +8,8 @@ _user_ids = itertools.count(1)
 
 
 class SmartParkUser(HttpUser):
-    # wait_time = between(1, 2)
-    wait_time = constant(0)
+    wait_time = between(1, 2)
+    # wait_time = constant(0)
     carpark_ids = [f"CBD_{number:03d}" for number in range(1, 17)]
 
     def on_start(self):
@@ -19,7 +19,7 @@ class SmartParkUser(HttpUser):
     def find_carparks(self):
         self.client.get(
             "/api/find-carparks",
-            params={"uuid": self.uid, "n": 3},
+            params={"uuid": self.uid, "n": 10},
             name="/api/find-carparks",
         )
 
