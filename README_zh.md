@@ -78,6 +78,52 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
    注意：IP 只是启发式身份标识，并不是真实身份：共享 NAT 会导致统计偏低，移动网络 IP 变化可能导致统计偏高，并且只应信任来自已知代理的 X-Forwarded-For。
 9. 运维仪表板。`/dashboard/` 使用 `app/static/plotly-2.35.2.min.js` 本地 Plotly.js 文件。停车场每 10 秒刷新，活跃用户每 5 秒刷新。成功刷新显示 `Refreshed at`；之后刷新失败会保留上一次成功快照并标记 stale。点击可用停车场行会显示缓存标注图片，且不会影响活跃用户统计。
 
+## 在 GKE 上统计缓存
+
+API 会分别记录 L1 本地内存命中、L2 Redis 命中、未命中、后台刷新和写入事件。在 Linux shell 中运行以下命令，可以按 API Pod 独立统计：
+
+```bash
+for pod in $(kubectl get pods -l app=smartpark-api \
+   -o jsonpath='{.items[*].metadata.name}'); do
+   echo "===== $pod ====="
+
+   kubectl logs "$pod" -c smartpark-api --tail=-1 |
+      awk '
+         /cache hit.*level=L1/ {
+            l1_hit++
+            if (/refresh=True/) l1_refresh++
+            next
+         }
+         /cache hit.*level=L2/ {
+            l2_hit++
+            if (/refresh=True/) l2_refresh++
+            next
+         }
+         /cache miss/                { miss++; next }
+         /cache write.*level=L1/     { l1_write++; next }
+         /cache write.*level=L2/     { l2_write++; next }
+         END {
+            hits = l1_hit + l2_hit
+            total = hits + miss
+            printf "%-15s %d\n", "L1 hit", l1_hit + 0
+            printf "%-15s %d\n", "L2 hit", l2_hit + 0
+            printf "%-15s %d\n", "Miss", miss + 0
+            printf "%-15s %d\n", "L1 refresh", l1_refresh + 0
+            printf "%-15s %d\n", "L2 refresh", l2_refresh + 0
+            printf "%-15s %d\n", "L1 write", l1_write + 0
+            printf "%-15s %d\n", "L2 write", l2_write + 0
+            if (total > 0) {
+               printf "%-15s %.2f%%\n", "L1 hit rate", 100 * l1_hit / total
+               printf "%-15s %.2f%%\n", "L2 hit rate", 100 * l2_hit / total
+               printf "%-15s %.2f%%\n", "Total hit rate", 100 * hits / total
+            }
+         }
+      '
+done
+```
+
+命中率的分母是 `L1 命中 + L2 命中 + miss`。缓存写入单独统计，不重复算作命中。`refresh=True` 表示当前请求会立即返回现有缓存，同时启动后台刷新。`kubectl logs` 读取当前容器保存的日志，因此比较不同 Pod 时应使用相同的压测时间窗口，并注意 Pod 重启会重置日志和 L1 缓存。
+
 ## OPS-API-1 响应语义
 
 `/api/ops/carparks` 会为每个已配置停车场返回一行，包括失败的停车场：

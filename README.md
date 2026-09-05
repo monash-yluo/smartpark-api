@@ -117,6 +117,58 @@ MODEL_PATH to the model.pt / model.onnx file.
    failure preserves the last snapshot and marks it stale. Clicking an available
    row opens its cached annotated image without affecting active-user statistics.
 
+## Cache statistics on GKE
+
+The API logs mutually identifiable events for L1 memory hits, L2 Redis hits,
+misses, refreshes, and writes. Run the following command from a Linux shell to
+summarise each API Pod independently:
+
+```bash
+for pod in $(kubectl get pods -l app=smartpark-api \
+   -o jsonpath='{.items[*].metadata.name}'); do
+   echo "===== $pod ====="
+
+   kubectl logs "$pod" -c smartpark-api --tail=-1 |
+      awk '
+         /cache hit.*level=L1/ {
+            l1_hit++
+            if (/refresh=True/) l1_refresh++
+            next
+         }
+         /cache hit.*level=L2/ {
+            l2_hit++
+            if (/refresh=True/) l2_refresh++
+            next
+         }
+         /cache miss/                { miss++; next }
+         /cache write.*level=L1/     { l1_write++; next }
+         /cache write.*level=L2/     { l2_write++; next }
+         END {
+            hits = l1_hit + l2_hit
+            total = hits + miss
+            printf "%-15s %d\n", "L1 hit", l1_hit + 0
+            printf "%-15s %d\n", "L2 hit", l2_hit + 0
+            printf "%-15s %d\n", "Miss", miss + 0
+            printf "%-15s %d\n", "L1 refresh", l1_refresh + 0
+            printf "%-15s %d\n", "L2 refresh", l2_refresh + 0
+            printf "%-15s %d\n", "L1 write", l1_write + 0
+            printf "%-15s %d\n", "L2 write", l2_write + 0
+            if (total > 0) {
+               printf "%-15s %.2f%%\n", "L1 hit rate", 100 * l1_hit / total
+               printf "%-15s %.2f%%\n", "L2 hit rate", 100 * l2_hit / total
+               printf "%-15s %.2f%%\n", "Total hit rate", 100 * hits / total
+            }
+         }
+      '
+done
+```
+
+The rate denominator is `L1 hits + L2 hits + misses`. Cache writes are reported
+separately and are not counted as hits. A refresh hit returns the current value
+immediately and also starts a background refresh. Because `kubectl logs` reads
+the current container log, compare Pods over the same test window and account
+for Pod restarts when interpreting the totals.
+
 ## OPS-API-1 response semantics
 
 `/api/ops/carparks` returns one row for every configured car park, including failures:
