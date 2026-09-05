@@ -18,10 +18,11 @@ Endpoints (per assignment):
   OPS-API-1   GET /api/ops/carparks                  列出所有车场 + 空位数
   OPS-API-2   GET /api/ops/users                     最近 30 秒的不同用户数
 
-OPS-REQ-2 (operational dashboard) is intentionally deferred to a later step; the
-module header in app/dashboard.py (not yet created) will hold it. The logging
-requirement (OPS-REQ-1) is handled by logging_utils + the middleware below.
-OPS-REQ-2(运营仪表盘)有意推迟到后续步骤;app/dashboard.py(尚未创建)的模块头将承载它.
+OPS-REQ-2 (operational dashboard) is served at /dashboard by app/dashboard.py;
+the browser uses Plotly.js and polls the two operational APIs independently.
+The logging requirement (OPS-REQ-1) is handled by logging_utils + the middleware below.
+OPS-REQ-2(运营仪表盘)由 app/dashboard.py 在 /dashboard 提供;
+浏览器使用 Plotly.js,并独立轮询两个运营 API.
 日志要求(OPS-REQ-1)由 logging_utils + 下方中间件处理.
 """
 
@@ -37,9 +38,11 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .cache import TTLCache
 from .config import CarPark, load_platform_config
+from .dashboard import router as dashboard_router
 from .inference import Detector, build_detector
 from .firestore_store import FirestoreStore
 from .logging_utils import (
@@ -126,6 +129,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="smartpark-api", version="1.0.0", lifespan=lifespan)
+app.mount(
+    "/static",
+    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
+    name="static",
+)
+app.include_router(dashboard_router)
 
 
 # ---------------------------------------------------------------------------

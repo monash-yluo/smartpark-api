@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#102a43">
+  <title>SmartPark Operations</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/dashboard/" aria-label="SmartPark operations home">
+        <span class="brand-mark" aria-hidden="true">SP</span>
+        <span><strong>SmartPark</strong><small>Operations centre</small></span>
+      </a>
+      <div class="topbar-actions">
+        <span class="live-indicator"><i></i>Live monitor</span>
+        <button class="refresh-button" id="refresh-all" type="button" title="Refresh dashboard data">Refresh data</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="intro-row">
+        <div>
+          <p class="eyebrow">Network overview / <span id="last-updated">Waiting for data</span></p>
+          <h1>Parking, at a glance.</h1>
+          <p class="intro-copy">A live view of availability and service health across the SmartPark network.</p>
+        </div>
+        <div class="system-status" id="system-status" data-state="loading">
+          <span class="status-dot"></span>
+          <span id="system-status-label">Connecting to services</span>
+        </div>
+      </section>
+
+      <section class="metrics-grid" aria-label="Network metrics">
+        <article class="metric-card metric-primary">
+          <div class="metric-label">Available spaces</div>
+          <div class="metric-value" id="total-spaces">--</div>
+          <div class="metric-foot">Across available car parks</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">Active users</div>
+          <div class="metric-value" id="active-users">--</div>
+          <div class="metric-foot">Last 30 seconds</div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-label">Car parks online</div>
+          <div class="metric-value" id="online-carparks">--</div>
+          <div class="metric-foot" id="carpark-count-foot">Waiting for status</div>
+        </article>
+        <article class="metric-card metric-alert">
+          <div class="metric-label">Attention needed</div>
+          <div class="metric-value" id="offline-carparks">--</div>
+          <div class="metric-foot">Unavailable camera or analysis</div>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel chart-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Capacity signal</p>
+              <h2>Available spaces by car park</h2>
+            </div>
+            <span class="panel-meta" id="chart-meta">Updating</span>
+          </div>
+          <div id="availability-chart" class="chart" role="img" aria-label="Bar chart of available spaces by car park"></div>
+          <div class="empty-state" id="chart-empty" hidden>No available car park data yet.</div>
+        </article>
+
+        <article class="panel activity-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Service pulse</p>
+              <h2>Operational notes</h2>
+            </div>
+          </div>
+          <div class="activity-list" id="activity-list">
+            <div class="activity-item activity-muted"><span class="activity-icon">...</span><p>Waiting for the first service update.</p></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading table-heading">
+          <div>
+            <p class="eyebrow">Live inventory</p>
+            <h2>Car park status</h2>
+          </div>
+          <span class="panel-meta" id="table-meta">No data</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Car park</th><th>Status</th><th>Available spaces</th><th>Model confidence</th></tr>
+            </thead>
+            <tbody id="carpark-rows">
+              <tr><td colspan="4" class="table-placeholder">Loading car park status...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer"><span>SmartPark Operations</span><span>Auto-refresh: services 5s / car parks 10s</span></footer>
+  </div>
+</body>
+</html>

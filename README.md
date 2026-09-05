@@ -18,7 +18,10 @@ already deployed to Cloud Run; this platform pulls images from it).
 | probe      | GET /healthz, GET /                     | Liveness / info |
 
 OPS-REQ-1 (request logging) is handled by the middleware + app/logging_utils.py.
-OPS-REQ-2 (operational dashboard) is intentionally deferred to a later step.
+OPS-REQ-2 (operational dashboard) is available at `/dashboard/`. It is served by
+FastAPI and uses Plotly.js in the browser. Car park telemetry refreshes every 10
+seconds and active-user telemetry refreshes every 5 seconds; the two data sources
+degrade independently when an operational dependency is unavailable.
 
 ## Project layout
 
@@ -29,7 +32,9 @@ OPS-REQ-2 (operational dashboard) is intentionally deferred to a later step.
     │  ├─ takephoto.py     # async HTTP client for the camera service
     │  ├─ inference.py     # YOLO wrapper (runtime-loaded model, thread-pool async)
    │  ├─ cache.py         # per-car-park TTL cache for inference results
-    │  └─ logging_utils.py # structured logging + uuid context + request log
+   │  ├─ dashboard.py     # operational dashboard route
+   │  ├─ static/          # dashboard HTML, CSS, and Plotly.js client code
+   │  └─ logging_utils.py # structured logging + uuid context + request log
     ├─ config/carparks.json  # car park list (generated; becomes a GKE ConfigMap)
     ├─ scripts/make_carparks.py  # regenerate carparks.json
     ├─ requirements.txt
@@ -93,7 +98,6 @@ MODEL_PATH to the model.pt / model.onnx file.
 
 ## Next steps
 
-- OPS-REQ-2 dashboard (matplotlib on demand).
 - GKE manifests (namespace, ConfigMaps, node service-account IAM permission,
   Deployment, LoadBalancer Service, HPA) and real deployment. The model uses
   GCS + an initContainer + shared `emptyDir`, rather than a PVC.

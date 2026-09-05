@@ -16,7 +16,9 @@
 | probe      | GET /healthz、GET / | 存活状态 / 信息 |
 
 OPS-REQ-1（请求日志）由中间件和 app/logging_utils.py 处理。
-OPS-REQ-2（运维仪表板）有意推迟到后续步骤。
+OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI 提供，
+浏览器使用 Plotly.js 绘图；车场遥测每 10 秒刷新，活跃用户每 5 秒刷新，
+两个数据源会在运营依赖不可用时独立降级。
 
 ## 项目结构
 
@@ -26,8 +28,10 @@ OPS-REQ-2（运维仪表板）有意推迟到后续步骤。
     │  ├─ config.py        # 从 carparks.json 加载停车场（唯一事实来源）
     │  ├─ takephoto.py     # 摄像头服务的异步 HTTP 客户端
     │  ├─ inference.py     # YOLO 封装（运行时加载模型、线程池异步执行）
-   │  ├─ cache.py         # 每个停车场的推理结果 TTL 缓存
-    │  └─ logging_utils.py # 结构化日志 + uuid 上下文 + 请求日志
+      │  ├─ cache.py         # 每个停车场的推理结果 TTL 缓存
+      │  ├─ dashboard.py     # 运维仪表板路由
+      │  ├─ static/          # 仪表板 HTML、CSS 和 Plotly.js 客户端代码
+      │  └─ logging_utils.py # 结构化日志 + uuid 上下文 + 请求日志
     ├─ config/carparks.json  # 停车场列表（生成文件；会成为 GKE ConfigMap）
     ├─ scripts/make_carparks.py  # 重新生成 carparks.json
     ├─ requirements.txt
@@ -66,7 +70,6 @@ OPS-REQ-2（运维仪表板）有意推迟到后续步骤。
 
 ## 后续步骤
 
-- OPS-REQ-2 仪表板（按需使用 matplotlib 生成）。
 - GKE 清单（命名空间、ConfigMap、节点服务账号 IAM 权限、Deployment、LoadBalancer Service、HPA）以及实际部署。模型使用 GCS + initContainer + 共享 `emptyDir`，而不是 PVC。
 
 ## 运行时模型部署

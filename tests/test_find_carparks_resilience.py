@@ -136,6 +136,24 @@ def run():
         else:
             print(f"  [FAIL] {label}  {detail}")
 
+    # ---------------------------------------------------------- dashboard ----
+    with fastapi.testclient.TestClient(app) as client:
+        dashboard_response = client.get("/dashboard")
+        dashboard_html = dashboard_response.text
+        dashboard_css = client.get("/static/dashboard.css")
+        dashboard_js = client.get("/static/dashboard.js")
+        print("\n[DASHBOARD] page and static assets")
+        check(
+            dashboard_response.status_code == 200
+            and "SmartPark Operations" in dashboard_html
+            and "/api/ops/carparks" in dashboard_js.text
+            and "/api/ops/users" in dashboard_js.text
+            and dashboard_css.status_code == 200
+            and dashboard_js.status_code == 200,
+            "dashboard page, CSS, and JavaScript assets are served",
+            f"(page={dashboard_response.status_code}, css={dashboard_css.status_code}, js={dashboard_js.status_code})",
+        )
+
     # -------------------------------------------------------------- G: uuid ----
     # CORE-API-1 requires uuid; FastAPI enforces it and returns 422 when missing /
     # blank / too long (validation handled by the framework, before any fetch).
