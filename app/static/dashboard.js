@@ -1,4 +1,5 @@
 (() => {
+  const REFRESH_INTERVAL_MS = 10000;
   const state = {
     carparks: null,
     carparksStale: false,
@@ -46,7 +47,9 @@
       : 'No successful car park update yet';
     $('last-updated').textContent = `${updated} / Refresh failed`;
     $('chart-meta').textContent = 'Stale data';
-    $('table-meta').textContent = 'Stale data';
+    $('table-refreshed-at').textContent = state.carparksLastUpdated
+      ? `Refreshed at ${state.carparksLastUpdated} / Stale`
+      : 'Not refreshed yet';
     setSystemState();
   }
 
@@ -68,8 +71,9 @@
       const available = row.status === 'available';
       const spaces = available ? Number(row.available_spaces).toLocaleString() : '--';
       const confidence = available && row.confidence_score != null ? `${(Number(row.confidence_score) * 100).toFixed(1)}%` : '--';
-      return `<tr><td>${escapeHtml(row.name || row.carpark_id)}</td><td><span class="status-pill ${available ? 'status-available' : 'status-unavailable'}">${available ? 'Available' : 'Unavailable'}</span></td><td>${spaces}</td><td class="confidence">${confidence}</td></tr>`;
-    }).join('') || '<tr><td colspan="4" class="table-placeholder">No car parks configured.</td></tr>';
+      const recordedAt = row.created_at ? new Date(row.created_at).toLocaleTimeString() : '--';
+      return `<tr><td>${escapeHtml(row.name || row.carpark_id)}</td><td><span class="status-pill ${available ? 'status-available' : 'status-unavailable'}">${available ? 'Available' : 'Unavailable'}</span></td><td>${spaces}</td><td class="confidence">${confidence}</td><td class="recorded-at">${escapeHtml(recordedAt)}</td></tr>`;
+    }).join('') || '<tr><td colspan="5" class="table-placeholder">No car parks configured.</td></tr>';
   }
 
   function updateChart(data) {
@@ -101,7 +105,7 @@
       state.carparks = data;
       state.carparksStale = false;
       state.carparksLastUpdated = new Date().toLocaleTimeString();
-      updateMetrics(data); updateTable(data); updateChart(data); setSystemState(); $('last-updated').textContent = `Updated ${state.carparksLastUpdated}`;
+      updateMetrics(data); updateTable(data); updateChart(data); setSystemState(); $('last-updated').textContent = `Updated ${state.carparksLastUpdated}`; $('table-refreshed-at').textContent = `Refreshed at ${state.carparksLastUpdated}`;
       addActivity(data.status === 'partial' || data.status === 'error' ? 'Some car park analysis is unavailable.' : 'Car park telemetry refreshed.', data.status === 'success' ? 'ok' : 'error');
     } catch (error) {
       addActivity(`Car park telemetry failed: ${error.message}`, 'error');
@@ -130,5 +134,5 @@
   $('refresh-all').addEventListener('click', refreshAll);
   refreshAll();
   window.setInterval(loadUsers, 5000);
-  window.setInterval(loadCarparks, 10000);
+  window.setInterval(loadCarparks, REFRESH_INTERVAL_MS);
 })();

@@ -58,3 +58,6 @@ h2 { font-size: 19px; }
 @keyframes rise-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @media (max-width: 900px) { .metrics-grid { grid-template-columns: repeat(2, 1fr); }.content-grid { grid-template-columns: 1fr; }.activity-panel { min-height: auto; } }
 @media (max-width: 600px) { .topbar { height: auto; min-height: 70px; padding: 15px 20px; }.topbar-actions { gap: 12px; }.live-indicator { display: none; } main { width: min(100% - 28px, 1400px); padding-top: 34px; }.intro-row { align-items: flex-start; flex-direction: column; }.system-status { align-self: stretch; }.metrics-grid { gap: 10px; }.metric-card { min-height: 125px; padding: 16px; }.metric-value { margin-top: 11px; font-size: 29px; }.panel { padding: 18px 15px; }.chart { height: 310px; }.footer { width: calc(100% - 28px); flex-direction: column; gap: 7px; } th, td { padding-left: 9px; padding-right: 9px; white-space: nowrap; } }
+
+.table-meta-group { display: flex; align-items: center; gap: 18px; }
+@media (max-width: 600px) { .table-meta-group { align-items: flex-end; flex-direction: column; gap: 4px; } }

@@ -34,6 +34,7 @@ import os
 import random
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Query, Request
@@ -468,6 +469,14 @@ async def ops_carparks():
     rows = []
     available_carparks = 0
     for carpark, result in zip(carparks, results):
+        created_at = app.state.cache.get_created_at(
+            ("carpark-analysis", carpark.id)
+        )
+        recorded_at = (
+            datetime.fromtimestamp(created_at, timezone.utc).isoformat()
+            if created_at is not None
+            else None
+        )
         if result is None:
             rows.append(
                 {
@@ -476,12 +485,13 @@ async def ops_carparks():
                     "status": "unavailable",
                     "available_spaces": None,
                     "confidence_score": None,
+                    "created_at": None,
                 }
             )
             continue
 
         available_carparks += 1
-        rows.append({**result, "status": "available"})
+        rows.append({**result, "status": "available", "created_at": recorded_at})
 
     unavailable_carparks = len(carparks) - available_carparks
     payload = {

@@ -147,6 +147,9 @@ def run():
         check(
             dashboard_response.status_code == 200
             and "SmartPark Operations" in dashboard_html
+            and "table-refreshed-at" in dashboard_html
+            and "Refreshed at" in dashboard_js.text
+            and "nextCarparksRefreshAt" not in dashboard_js.text
             and "/static/plotly-2.35.2.min.js" in dashboard_html
             and "https://cdn.plot.ly" not in dashboard_html
             and "/api/ops/carparks" in dashboard_js.text
@@ -218,6 +221,7 @@ def run():
                 row["status"] == "unavailable"
                 and row["available_spaces"] is None
                 and row["confidence_score"] is None
+                and row["created_at"] is None
                 for row in ops_body["carparks"]
             ),
             "503 + every configured car park has an unavailable row",
@@ -506,7 +510,12 @@ def run():
                 and ops_body["available_carparks"] == 30
                 and ops_body["unavailable_carparks"] == 0
                 and len(ops_body["carparks"]) == 30
-                and all(row["status"] == "available" for row in ops_body["carparks"]),
+                and all(
+                    row["status"] == "available"
+                    and isinstance(row["created_at"], str)
+                    and row["created_at"].endswith("+00:00")
+                    for row in ops_body["carparks"]
+                ),
                 "200 + every configured car park has an available row",
                 f"(status={ops_response.status_code}, rows={len(ops_body.get('carparks', []))})",
             )

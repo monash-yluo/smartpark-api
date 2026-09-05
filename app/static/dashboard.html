@@ -90,15 +90,18 @@
             <p class="eyebrow">Live inventory</p>
             <h2>Car park status</h2>
           </div>
-          <span class="panel-meta" id="table-meta">No data</span>
+          <div class="table-meta-group">
+            <span class="panel-meta" id="table-refreshed-at">Not refreshed yet</span>
+            <span class="panel-meta" id="table-meta">No data</span>
+          </div>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Car park</th><th>Status</th><th>Available spaces</th><th>Model confidence</th></tr>
+              <tr><th>Car park</th><th>Status</th><th>Available spaces</th><th>Model confidence</th><th>Recorded at</th></tr>
             </thead>
             <tbody id="carpark-rows">
-              <tr><td colspan="4" class="table-placeholder">Loading car park status...</td></tr>
+              <tr><td colspan="5" class="table-placeholder">Loading car park status...</td></tr>
             </tbody>
           </table>
         </div>

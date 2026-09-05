@@ -98,6 +98,18 @@ class TTLCache:
                 value,
             )
 
+    def get_created_at(self, key) -> float | None:
+        """返回未过期缓存条目的创建时间戳;不存在或过期时返回 None."""
+        with self._lock:
+            item = self._data.get(key)
+            if item is None:
+                return None
+            created_at, expires_at, _ = item
+            if time.time() > expires_at:
+                del self._data[key]
+                return None
+            return created_at
+
     def clear(self) -> None:
         """清空所有缓存条目."""
         with self._lock:
