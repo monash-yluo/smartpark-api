@@ -1,5 +1,11 @@
 (() => {
-  const state = { carparks: null, users: null, requests: { carparks: false, users: false } };
+  const state = {
+    carparks: null,
+    carparksStale: false,
+    carparksLastUpdated: null,
+    users: null,
+    requests: { carparks: false, users: false }
+  };
   const $ = (id) => document.getElementById(id);
 
   function escapeHtml(value) {
@@ -22,13 +28,26 @@
   function setSystemState() {
     const status = $('system-status');
     const label = $('system-status-label');
-    if (state.carparks?.status === 'error' || state.users?.status === 'error') {
+    if (state.carparksStale) {
+      status.dataset.state = 'stale'; label.textContent = 'Showing stale car park data';
+    } else if (state.carparks?.status === 'error' || state.users?.status === 'error') {
       status.dataset.state = 'error'; label.textContent = 'Operational data unavailable';
     } else if (state.carparks?.status === 'partial' || state.users?.error) {
       status.dataset.state = 'degraded'; label.textContent = 'Operating with degraded data';
     } else if (state.carparks && state.users) {
       status.dataset.state = 'healthy'; label.textContent = 'All services reporting';
     }
+  }
+
+  function markCarparksStale() {
+    state.carparksStale = true;
+    const updated = state.carparksLastUpdated
+      ? `Last successful update ${state.carparksLastUpdated}`
+      : 'No successful car park update yet';
+    $('last-updated').textContent = `${updated} / Refresh failed`;
+    $('chart-meta').textContent = 'Stale data';
+    $('table-meta').textContent = 'Stale data';
+    setSystemState();
   }
 
   function updateMetrics(data) {
@@ -78,12 +97,19 @@
     try {
       const response = await fetch('/api/ops/carparks', { cache: 'no-store' });
       const data = await response.json();
-      if (!response.ok && response.status !== 503) throw new Error(data.msg || 'Car park service failed');
+      if (!response.ok) throw new Error(data.msg || 'Car park service failed');
       state.carparks = data;
-      updateMetrics(data); updateTable(data); updateChart(data); setSystemState(); $('last-updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+      state.carparksStale = false;
+      state.carparksLastUpdated = new Date().toLocaleTimeString();
+      updateMetrics(data); updateTable(data); updateChart(data); setSystemState(); $('last-updated').textContent = `Updated ${state.carparksLastUpdated}`;
       addActivity(data.status === 'partial' || data.status === 'error' ? 'Some car park analysis is unavailable.' : 'Car park telemetry refreshed.', data.status === 'success' ? 'ok' : 'error');
     } catch (error) {
-      addActivity(`Car park telemetry failed: ${error.message}`, 'error'); $('system-status').dataset.state = 'error'; $('system-status-label').textContent = 'Car park service unavailable';
+      addActivity(`Car park telemetry failed: ${error.message}`, 'error');
+      if (state.carparks) {
+        markCarparksStale();
+      } else {
+        $('system-status').dataset.state = 'error'; $('system-status-label').textContent = 'Car park service unavailable';
+      }
     } finally { state.requests.carparks = false; }
   }
 

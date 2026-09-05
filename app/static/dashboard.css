@@ -40,6 +40,7 @@ h2 { font-size: 19px; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .system-status[data-state="healthy"] .status-dot { background: var(--teal-bright); }
 .system-status[data-state="degraded"] .status-dot { background: #f59e0b; }
+.system-status[data-state="stale"] .status-dot { background: #d97706; }
 .system-status[data-state="error"] .status-dot { background: var(--red); }
 .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
 .metric-card, .panel { border: 1px solid var(--line); background: var(--white); box-shadow: var(--shadow); }

@@ -81,9 +81,10 @@ MODEL_PATH to the model.pt / model.onnx file.
    annotated image) is cached by car-park ID for the TTL, so all endpoints reuse it.
 6. Large n (what-if). n is clamped to the number of car parks, and at most 2*n are
    sampled, so a huge n (e.g. 200) cannot be abused to hit the cameras/replicas.
-7. Known caveat. OPS-API-2 counts from an in-memory request log, so it is per-pod.
-   Across replicas each pod sees only its own traffic; a cluster-wide count would
-   need shared storage (Redis / Cloud Logging).
+7. Shared operational user tracking. OPS-API-2 stores active users in Firestore and
+   counts documents updated during the last 30 seconds, so the result is shared
+   across replicas. If Firestore is disabled or unavailable, the endpoint returns
+   503 rather than reporting a misleading per-pod count.
 8. User identity: uuid with IP fallback. The platform needs a stable id so a user's
    requests group together (for logging and OPS-API-2 user counting). If the client
    supplies a uuid we use "user:<uuid>"; if not, we fall back to the client IP

@@ -142,16 +142,23 @@ def run():
         dashboard_html = dashboard_response.text
         dashboard_css = client.get("/static/dashboard.css")
         dashboard_js = client.get("/static/dashboard.js")
+        plotly_js = client.get("/static/plotly-2.35.2.min.js")
         print("\n[DASHBOARD] page and static assets")
         check(
             dashboard_response.status_code == 200
             and "SmartPark Operations" in dashboard_html
+            and "/static/plotly-2.35.2.min.js" in dashboard_html
+            and "https://cdn.plot.ly" not in dashboard_html
             and "/api/ops/carparks" in dashboard_js.text
             and "/api/ops/users" in dashboard_js.text
+            and "Showing stale car park data" in dashboard_js.text
             and dashboard_css.status_code == 200
-            and dashboard_js.status_code == 200,
-            "dashboard page, CSS, and JavaScript assets are served",
-            f"(page={dashboard_response.status_code}, css={dashboard_css.status_code}, js={dashboard_js.status_code})",
+            and dashboard_js.status_code == 200
+            and plotly_js.status_code == 200
+            and len(plotly_js.content) > 100000
+            and "Plotly" in plotly_js.text,
+            "dashboard, stale handling, CSS, JavaScript, and local Plotly assets are served",
+            f"(page={dashboard_response.status_code}, css={dashboard_css.status_code}, js={dashboard_js.status_code}, plotly={plotly_js.status_code})",
         )
 
     # -------------------------------------------------------------- G: uuid ----
