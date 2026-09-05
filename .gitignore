@@ -7,3 +7,4 @@ model/
 *.onnx
 *.pt
 scripts/response.json
+locust_screenshot/*
