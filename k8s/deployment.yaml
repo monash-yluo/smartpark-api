@@ -38,7 +38,7 @@ spec:
               mountPath: /data
       containers:
         - name: smartpark-api
-          image: australia-southeast2-docker.pkg.dev/project-ff562683-42b2-45ca-9de/fit3184/smartpark-api:v4
+          image: australia-southeast2-docker.pkg.dev/project-ff562683-42b2-45ca-9de/fit3184/smartpark-api:v4.1
           env:
             - name: MODEL_PATH
               value: /data/model.pt
