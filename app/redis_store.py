@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
+import time
+
+from .cache import CacheLookup
 
 
 class RedisStore:
     """Async Redis adapter for the rolling distinct active-user count."""
 
     _KEY = "smartpark:active-users"
+    _ANALYSIS_KEY_PREFIX = "smartpark:analysis:"
     _COUNT_SCRIPT = """
 local now = redis.call('TIME')
 local now_ms = now[1] * 1000 + math.floor(now[2] / 1000)
@@ -60,6 +66,50 @@ return redis.call('ZCARD', KEYS[1])
             int(seconds * 1000),
         )
         return int(result)
+
+    async def set_analysis(
+        self, carpark_id: str, analysis: dict, ttl_s: int
+    ) -> None:
+        payload = json.dumps(
+            {
+                "created_at": time.time(),
+                "available_spaces": analysis["available_spaces"],
+                "occupied_spaces": analysis["occupied_spaces"],
+                "confidence_score": analysis["confidence_score"],
+                "annotated_png": base64.b64encode(
+                    analysis["annotated_png"]
+                ).decode("ascii"),
+            },
+            separators=(",", ":"),
+        )
+        await self._get_client().set(
+            f"{self._ANALYSIS_KEY_PREFIX}{carpark_id}",
+            payload,
+            ex=ttl_s,
+        )
+
+    async def get_analysis(
+        self, carpark_id: str, refresh_after_s: float
+    ) -> CacheLookup | None:
+        payload = await self._get_client().get(
+            f"{self._ANALYSIS_KEY_PREFIX}{carpark_id}"
+        )
+        if payload is None:
+            return None
+
+        decoded = json.loads(payload)
+        created_at = float(decoded["created_at"])
+        analysis = {
+            "available_spaces": int(decoded["available_spaces"]),
+            "occupied_spaces": int(decoded["occupied_spaces"]),
+            "confidence_score": float(decoded["confidence_score"]),
+            "annotated_png": base64.b64decode(decoded["annotated_png"], validate=True),
+            "_created_at": created_at,
+        }
+        return CacheLookup(
+            value=analysis,
+            should_refresh=time.time() - created_at >= refresh_after_s,
+        )
 
     async def close(self) -> None:
         if self._client is not None:

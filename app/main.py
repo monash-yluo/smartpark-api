@@ -288,6 +288,15 @@ async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
         return None
 
     app.state.cache.set(cache_key, analysis)
+    if isinstance(app.state.user_activity, RedisStore):
+        try:
+            await app.state.user_activity.set_analysis(
+                carpark.id,
+                analysis,
+                app.state.config.request_cache_ttl_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - shared cache is optional
+            log.warning("Redis analysis cache write failed for %s: %s", carpark.id, exc)
     return analysis
 
 
@@ -337,6 +346,20 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
             await _get_or_start_analysis_task(carpark)
         return cached.value
 
+    if isinstance(app.state.user_activity, RedisStore):
+        try:
+            shared_cached = await app.state.user_activity.get_analysis(
+                carpark.id,
+                app.state.config.request_cache_refresh_after_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - shared cache is optional
+            log.warning("Redis analysis cache read failed for %s: %s", carpark.id, exc)
+        else:
+            if shared_cached is not None:
+                if shared_cached.should_refresh:
+                    await _get_or_start_analysis_task(carpark)
+                return shared_cached.value
+
     async with app.state.inflight_analyses_lock:
         # 等待锁时,另一个请求可能已经完成分析并写入缓存. / Another request may have completed the analysis while this request was waiting for the lock.
         cached = app.state.cache.get(cache_key)
@@ -363,12 +386,15 @@ async def _analyze_carpark(carpark: CarPark) -> dict | None:
     analysis = await _get_carpark_analysis(carpark)
     if analysis is None:
         return None
-    return {
+    summary = {
         "carpark_id": carpark.id,
         "name": carpark.name,
         "available_spaces": analysis["available_spaces"],
         "confidence_score": round(analysis["confidence_score"], 3),
     }
+    if "_created_at" in analysis:
+        summary["_created_at"] = analysis["_created_at"]
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +460,10 @@ async def find_carparks(
             },
         )
     ok.sort(key=lambda r: r["available_spaces"], reverse=True)
-    top = ok[:eff_n]
+    top = [
+        {key: value for key, value in result.items() if key != "_created_at"}
+        for result in ok[:eff_n]
+    ]
 
     elapsed_ms = (time.perf_counter() - start) * 1000
     payload = {
@@ -528,6 +557,8 @@ async def ops_carparks():
         created_at = app.state.cache.get_created_at(
             ("carpark-analysis", carpark.id)
         )
+        if created_at is None and result is not None:
+            created_at = result.get("_created_at")
         recorded_at = (
             datetime.fromtimestamp(created_at, timezone.utc).isoformat()
             if created_at is not None
@@ -547,7 +578,10 @@ async def ops_carparks():
             continue
 
         available_carparks += 1
-        rows.append({**result, "status": "available", "created_at": recorded_at})
+        public_result = {
+            key: value for key, value in result.items() if key != "_created_at"
+        }
+        rows.append({**public_result, "status": "available", "created_at": recorded_at})
 
     unavailable_carparks = len(carparks) - available_carparks
     payload = {

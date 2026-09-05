@@ -70,7 +70,7 @@ MODEL_PATH to the model.pt / model.onnx file.
 - FIRESTORE_DATABASE Firestore database ID (default `(default)`)
 - PORT             listen port                    (default 8000)
 
-## Key design decisions (worth explaining in the interview)
+## Key design decisions
 
 1. Car park discovery = single source of truth. The platform loads car parks from
    carparks.json at startup. On GKE that JSON is a ConfigMap mounted into every
@@ -88,7 +88,11 @@ MODEL_PATH to the model.pt / model.onnx file.
 5. Per-car-park inference cache. A successful analysis (counts, confidence, and
    annotated image) is cached by car-park ID for the TTL, so all endpoints reuse it.
    OPS-API-1 exposes each successful entry's `created_at` in UTC ISO 8601 format.
-   The operator image endpoint reuses the cached annotated PNG.
+   The operator image endpoint reuses the cached annotated PNG. When Redis is the
+   selected activity backend, Redis also acts as an L2 analysis cache shared by all
+   Pods: reads check local L1 first and then Redis, while inference writes both with
+   the same TTL. An L2 hit is returned without extending or backfilling L1. With the
+   Firestore backend, analysis caching remains local-only as before.
 6. Large n (what-if). n is clamped to the number of car parks, and at most 2*n are
    sampled, so a huge n (e.g. 200) cannot be abused to hit the cameras/replicas.
 7. Shared operational user tracking. OPS-API-2 uses a shared Redis ZSET when
