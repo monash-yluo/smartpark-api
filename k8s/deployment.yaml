@@ -54,6 +54,10 @@ spec:
               value: "fit3184-a1"
             - name: INFERENCE_WORKERS
               value: "2"
+            - name: REQUEST_CACHE_TTL
+              value: "30"
+            - name: REQUEST_CACHE_REFRESH_AFTER
+              value: "20"
           ports:
             - name: http
               containerPort: 8000

@@ -36,11 +36,11 @@ spec:
               port: redis
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 1
+              memory: 1Gi
             limits:
-              cpu: 500m
-              memory: 256Mi
+              cpu: 1500m
+              memory: 2Gi
 ---
 apiVersion: v1
 kind: Service
