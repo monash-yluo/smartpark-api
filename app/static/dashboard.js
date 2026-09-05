@@ -72,8 +72,41 @@
       const spaces = available ? Number(row.available_spaces).toLocaleString() : '--';
       const confidence = available && row.confidence_score != null ? `${(Number(row.confidence_score) * 100).toFixed(1)}%` : '--';
       const recordedAt = row.created_at ? new Date(row.created_at).toLocaleTimeString() : '--';
-      return `<tr><td>${escapeHtml(row.name || row.carpark_id)}</td><td><span class="status-pill ${available ? 'status-available' : 'status-unavailable'}">${available ? 'Available' : 'Unavailable'}</span></td><td>${spaces}</td><td class="confidence">${confidence}</td><td class="recorded-at">${escapeHtml(recordedAt)}</td></tr>`;
+      const rowAttributes = available
+        ? `class="carpark-row" data-carpark-id="${escapeHtml(row.carpark_id)}" tabindex="0" role="button" aria-label="View analysis image for ${escapeHtml(row.name || row.carpark_id)}"`
+        : 'class="carpark-row carpark-row-disabled"';
+      return `<tr ${rowAttributes}><td>${escapeHtml(row.name || row.carpark_id)}</td><td><span class="status-pill ${available ? 'status-available' : 'status-unavailable'}">${available ? 'Available' : 'Unavailable'}</span></td><td>${spaces}</td><td class="confidence">${confidence}</td><td class="recorded-at">${escapeHtml(recordedAt)}</td></tr>`;
     }).join('') || '<tr><td colspan="5" class="table-placeholder">No car parks configured.</td></tr>';
+  }
+
+  async function openCarparkImage(carparkId) {
+    const dialog = $('carpark-dialog');
+    const image = $('analysis-image');
+    $('dialog-title').textContent = carparkId;
+    $('image-loading').hidden = false;
+    $('image-error').hidden = true;
+    $('image-metrics').hidden = true;
+    image.hidden = true;
+    image.removeAttribute('src');
+    dialog.showModal();
+
+    try {
+      const response = await fetch(`/api/ops/carparks/${encodeURIComponent(carparkId)}/image`, { cache: 'no-store' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.msg || 'Analysis image is unavailable');
+      $('dialog-title').textContent = data.name || data.carpark_id;
+      $('image-spaces').textContent = Number(data.available_spaces).toLocaleString();
+      $('image-confidence').textContent = `${(Number(data.confidence_score) * 100).toFixed(1)}%`;
+      image.alt = `Annotated parking analysis for ${data.name || data.carpark_id}`;
+      image.src = `data:image/png;base64,${data.image_base64}`;
+      image.hidden = false;
+      $('image-metrics').hidden = false;
+    } catch (error) {
+      $('image-error').textContent = error.message;
+      $('image-error').hidden = false;
+    } finally {
+      $('image-loading').hidden = true;
+    }
   }
 
   function updateChart(data) {
@@ -131,6 +164,23 @@
   }
 
   function refreshAll() { loadCarparks(); loadUsers(); }
+  $('carpark-rows').addEventListener('click', (event) => {
+    const row = event.target.closest('[data-carpark-id]');
+    if (row) openCarparkImage(row.dataset.carparkId);
+  });
+  $('carpark-rows').addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const row = event.target.closest('[data-carpark-id]');
+    if (row) {
+      event.preventDefault();
+      openCarparkImage(row.dataset.carparkId);
+    }
+  });
+  $('dialog-close').addEventListener('click', () => $('carpark-dialog').close());
+  $('carpark-dialog').addEventListener('close', () => $('analysis-image').removeAttribute('src'));
+  $('carpark-dialog').addEventListener('click', (event) => {
+    if (event.target === $('carpark-dialog')) $('carpark-dialog').close();
+  });
   $('refresh-all').addEventListener('click', refreshAll);
   refreshAll();
   window.setInterval(loadUsers, 5000);

@@ -508,6 +508,33 @@ async def ops_carparks():
     return payload
 
 
+@app.get("/api/ops/carparks/{carpark_id}/image")
+async def ops_carpark_image(carpark_id: str):
+    """返回指定停车场的缓存分析图片，供运营仪表板按需查看。"""
+    carpark = app.state.config.carpark_by_id(carpark_id)
+    if carpark is None:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "msg": f"unknown carpark_id {carpark_id}"},
+        )
+
+    analysis = await _get_carpark_analysis(carpark)
+    if analysis is None:
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "msg": "image analysis failed"},
+        )
+
+    return {
+        "status": "success",
+        "carpark_id": carpark.id,
+        "name": carpark.name,
+        "available_spaces": analysis["available_spaces"],
+        "confidence_score": round(analysis["confidence_score"], 3),
+        "image_base64": base64.b64encode(analysis["annotated_png"]).decode("utf-8"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # OPS-API-2: distinct users in the last 30 seconds (derived from OPS-REQ-1 logs)
 # OPS-API-2:最近 30 秒内的不同用户数(由 OPS-REQ-1 日志推导)

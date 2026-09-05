@@ -148,8 +148,10 @@ def run():
             dashboard_response.status_code == 200
             and "SmartPark Operations" in dashboard_html
             and "table-refreshed-at" in dashboard_html
+            and "carpark-dialog" in dashboard_html
             and "Refreshed at" in dashboard_js.text
             and "nextCarparksRefreshAt" not in dashboard_js.text
+            and "/api/ops/carparks/${encodeURIComponent(carparkId)}/image" in dashboard_js.text
             and "/static/plotly-2.35.2.min.js" in dashboard_html
             and "https://cdn.plot.ly" not in dashboard_html
             and "/api/ops/carparks" in dashboard_js.text
@@ -518,6 +520,18 @@ def run():
                 ),
                 "200 + every configured car park has an available row",
                 f"(status={ops_response.status_code}, rows={len(ops_body.get('carparks', []))})",
+            )
+
+            image_response = client.get("/api/ops/carparks/CBD_001/image")
+            image_body = image_response.json()
+            print("\n[OPS] cached car park analysis image")
+            check(
+                image_response.status_code == 200
+                and image_body["status"] == "success"
+                and image_body["carpark_id"] == "CBD_001"
+                and base64.b64decode(image_body["image_base64"]) == base64.b64decode(_1x1_PNG),
+                "operator image endpoint returns the cached annotated image",
+                f"(status={image_response.status_code}, carpark={image_body.get('carpark_id')})",
             )
 
         # B: half fail -> 200, failed_carparks > 0

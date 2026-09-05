@@ -108,6 +108,27 @@
       </section>
     </main>
 
+    <dialog class="image-dialog" id="carpark-dialog" aria-labelledby="dialog-title">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">Analysis preview</p>
+          <h2 id="dialog-title">Car park analysis</h2>
+        </div>
+        <button class="dialog-close" id="dialog-close" type="button" title="Close image preview" aria-label="Close image preview">&times;</button>
+      </div>
+      <div class="dialog-body">
+        <div class="image-stage">
+          <div class="image-loading" id="image-loading">Loading analysis image...</div>
+          <img id="analysis-image" alt="" hidden>
+        </div>
+        <div class="dialog-error" id="image-error" hidden></div>
+        <div class="image-metrics" id="image-metrics" hidden>
+          <span><strong id="image-spaces">--</strong> available spaces</span>
+          <span><strong id="image-confidence">--</strong> model confidence</span>
+        </div>
+      </div>
+    </dialog>
+
     <footer class="footer"><span>SmartPark Operations</span><span>Auto-refresh: services 5s / car parks 10s</span></footer>
   </div>
 </body>
