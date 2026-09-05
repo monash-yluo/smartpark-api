@@ -455,12 +455,38 @@ async def annotate_carpark(
 async def ops_carparks():
     """查询所有已配置车场，并返回各车场当前的可用车位数。"""
     carparks = list(app.state.config.carparks)
-    # Note: running inference on every car park is heavy; acceptable for an
-    # operator endpoint. A short per-car park cache could be added.
-    # 注意:对每个车场跑推理较消耗资源;作为运营端点可接受.可增加短时的按车场缓存.
     results = await asyncio.gather(*(_analyze_carpark(cp) for cp in carparks))
-    rows = [r for r in results if r is not None]
-    return {"status": "success", "count": len(rows), "carparks": rows}
+    rows = []
+    available_carparks = 0
+    for carpark, result in zip(carparks, results):
+        if result is None:
+            rows.append(
+                {
+                    "carpark_id": carpark.id,
+                    "name": carpark.name,
+                    "status": "unavailable",
+                    "available_spaces": None,
+                    "confidence_score": None,
+                }
+            )
+            continue
+
+        available_carparks += 1
+        rows.append({**result, "status": "available"})
+
+    unavailable_carparks = len(carparks) - available_carparks
+    payload = {
+        "status": "success" if unavailable_carparks == 0 else "partial",
+        "total_carparks": len(carparks),
+        "available_carparks": available_carparks,
+        "unavailable_carparks": unavailable_carparks,
+        "carparks": rows,
+    }
+    if not available_carparks:
+        payload["status"] = "error"
+        payload["msg"] = "all car parks are unavailable"
+        return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 # ---------------------------------------------------------------------------

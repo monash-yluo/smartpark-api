@@ -8,6 +8,7 @@ Verifies the change documented in doc/handoff-main-resilience.md:
   * Scenario E: EVERY inference raises (e2e)          -> HTTP 503
   * Scenario C: EVERY car park succeeds               -> HTTP 200, failed_carparks == 0
   * Scenario B: SOME car parks fail                   -> HTTP 200, failed_carparks > 0 (no false 503)
+    * OPS-API-1: all/some/no car parks available        -> complete status rows + summary
 
 How to run (from the smartpark-api root, with the venv):
     .\\venv\\Scripts\\python.exe tests\\test_find_carparks_resilience.py
@@ -176,6 +177,26 @@ def run():
             and b["sampled_carparks"] == 6,
             "503 + empty results",
             f"(status={r.status_code}, sampled={b.get('sampled_carparks')})",
+        )
+
+        ops_response = client.get("/api/ops/carparks")
+        ops_body = ops_response.json()
+        print("\n[OPS] all car parks unavailable")
+        check(
+            ops_response.status_code == 503
+            and ops_body["status"] == "error"
+            and ops_body["total_carparks"] == 30
+            and ops_body["available_carparks"] == 0
+            and ops_body["unavailable_carparks"] == 30
+            and len(ops_body["carparks"]) == 30
+            and all(
+                row["status"] == "unavailable"
+                and row["available_spaces"] is None
+                and row["confidence_score"] is None
+                for row in ops_body["carparks"]
+            ),
+            "503 + every configured car park has an unavailable row",
+            f"(status={ops_response.status_code}, rows={len(ops_body.get('carparks', []))})",
         )
 
     # ------------------------------------------------------------------ D ----
@@ -450,6 +471,21 @@ def run():
                 f"(status={r.status_code}, failed={b.get('failed_carparks')}, results={len(b.get('results', []))})",
             )
 
+            ops_response = client.get("/api/ops/carparks")
+            ops_body = ops_response.json()
+            print("\n[OPS] all car parks available")
+            check(
+                ops_response.status_code == 200
+                and ops_body["status"] == "success"
+                and ops_body["total_carparks"] == 30
+                and ops_body["available_carparks"] == 30
+                and ops_body["unavailable_carparks"] == 0
+                and len(ops_body["carparks"]) == 30
+                and all(row["status"] == "available" for row in ops_body["carparks"]),
+                "200 + every configured car park has an available row",
+                f"(status={ops_response.status_code}, rows={len(ops_body.get('carparks', []))})",
+            )
+
         # B: half fail -> 200, failed_carparks > 0
         _patch_env(_write_config("mixed", mock_url))
         with fastapi.testclient.TestClient(app) as client2:
@@ -460,6 +496,22 @@ def run():
                 r2.status_code == 200 and b2["failed_carparks"] > 0,
                 "200 + failed_carparks disclosed",
                 f"(status={r2.status_code}, failed={b2.get('failed_carparks')}, results={len(b2.get('results', []))})",
+            )
+
+            ops_response = client2.get("/api/ops/carparks")
+            ops_body = ops_response.json()
+            statuses = {row["status"] for row in ops_body["carparks"]}
+            print("\n[OPS] some car parks unavailable")
+            check(
+                ops_response.status_code == 200
+                and ops_body["status"] == "partial"
+                and ops_body["total_carparks"] == 30
+                and ops_body["available_carparks"] == 15
+                and ops_body["unavailable_carparks"] == 15
+                and len(ops_body["carparks"]) == 30
+                and statuses == {"available", "unavailable"},
+                "200 partial + every configured car park has a status row",
+                f"(available={ops_body.get('available_carparks')}, unavailable={ops_body.get('unavailable_carparks')})",
             )
     finally:
         srv.shutdown()
