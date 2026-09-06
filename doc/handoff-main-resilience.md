@@ -566,72 +566,115 @@ Logging 导出到可查询存储；这会增加写入量、查询复杂度和成
 
 ## Performance Analysis
 
-The results show diminishing returns after two Pods. Sustainable capacity rises from 35
-users with one Pod to 80 with two Pods, but remains at 80 for four and eight Pods. At 80
-users, average latency changes from 3378.76 ms (two Pods) to 3244.43 ms (four) and
-3255.71 ms (eight): four Pods improve latency by only 3.98%, while eight provide no
-further improvement. At 90 users, scaling from two to eight Pods reduces latency from
-3809.77 ms to 3509.26 ms, only 7.89%. Capacity per Pod consequently falls from 40 users
-with two Pods to 20 with four and 10 with eight. The apparent 114.3% efficiency of two
-Pods relative to one is likely caused by coarse test points, cache state, and run
-variation rather than true super-linear scaling.
+The results show diminishing returns after two Pods, but they do not show that the
+Kubernetes nodes themselves ran out of CPU. Sustainable capacity rises from 35 users
+with one Pod to 80 with two Pods, while the tested limit remains about 80 users for four
+and eight Pods. At 80 users, average latency changes from 3378.76 ms (two Pods) to
+3244.43 ms (four) and 3255.71 ms (eight): four Pods improve latency by only 3.98%, and
+eight Pods are 0.35% slower than four, which is within likely run-to-run variation. At
+90 users, scaling from two to eight Pods reduces average latency from 3809.77 ms to
+3509.26 ms, only 7.89%. The apparent 114.3% efficiency of two Pods relative to one
+should therefore not be interpreted as true super-linear scaling. The test points,
+cache state, request distribution, and run variation can all affect this estimate.
 
-The primary bottleneck is CPU-bound YOLO inference. Each Pod has four inference threads
-but a two-CPU Kubernetes limit, so workers compete for CPU and tasks can queue. Moreover,
-`find-carparks(n=10)` concurrently fans out to as many as 20 camera fetches and YOLO
-tasks. FastAPI's asynchronous routes and `run_in_executor` prevent YOLO from blocking the
-event loop, but cannot remove CPU contention. Cold requests also depend on the shared
-takephoto service. L1/Redis L2 caching and per-Pod single-flight reduce repeated work,
-but cold L1/L2 misses lack a cross-Pod lock, allowing several Pods to fetch and infer the
-same car park. Redis transfer and Base64 serialization of annotated PNGs add overhead.
-The measured plateau is consistent with these constraints, although CPU throttling,
-executor wait time, dependency latency, and cache-hit metrics are needed to identify
-their individual impact.
+The strongest evidence is for an end-to-end queueing or shared-bottleneck problem,
+rather than insufficient aggregate Node capacity. Each API Pod has a 2-CPU limit and
+uses four YOLO executor workers by default. A worker count of four does not give one Pod
+four CPUs; it can cause CPU contention, cgroup throttling, or executor queueing when
+several predictions arrive together. In addition, `find-carparks(n=10)` samples up to
+20 car parks and gathers their analyses concurrently. Each cold or expired analysis can
+therefore require one camera request and one YOLO prediction. The Locust test also sends
+`annotate-carpark` requests with equal task weight, and both request types have a
+10-second client timeout. FastAPI and `run_in_executor` keep YOLO off the event loop,
+but they do not remove CPU contention or downstream queueing. The shared takephoto
+service is another possible bottleneck because every cold miss and refresh depends on
+it. Redis L2 and per-Pod single-flight reduce duplicate work, but cold L1/L2 misses are
+not protected by a cross-Pod lock, so multiple Pods can still fetch and infer the same
+car park.
 
-Mitigation should first benchmark `INFERENCE_WORKERS=1`, `2`, and `4`, then match worker
-count to the CPU limit or allocate additional CPU. A bounded semaphore/queue with a
-deadline should return 429/503 during overload instead of allowing requests to wait for
-Locust's 10-second timeout. The `2*n` fan-out should be bounded or processed in batches,
-and Redis single-flight should cover cold misses so only one Pod performs duplicate
-work. Takephoto should be monitored and scaled if saturated, while occupancy metadata
-should be cached separately from large PNG payloads. Finally, HPA should consider
-inference queue depth as well as CPU, and each experiment should be repeated while
-recording RPS, latency percentiles, CPU throttling, dependency latency, and cache hits.
+The cache logs confirm that caching is effective, but they do not prove that inference
+load is negligible. In the recorded two-Pod summary, L1 hits were 34,046, L2 hits 749,
+and misses 442, giving 98.75% total cache hits. However, 4,910 L1 hits and 146 L2 hits
+were marked `refresh=True`. Those requests return the old value immediately but may
+start a background refresh. Consequently, `cache hit` is not equivalent to "no YOLO
+work". The most relevant counters for actual refresh pressure are
+`inference refresh started`, `cache write | level=L1/L2`,
+`reason=lock-held`, and `reason=l2-updated`; those counters were not included in the
+recorded summary, so the number of actual inference runs cannot yet be calculated.
+
+The data directly establish the scaling plateau and the timeout-bound tail latency:
+at 80 users, P95/P99 were 9200/10000 ms for two Pods, 8800/10000 ms for four Pods, and
+8900/10000 ms for eight Pods; at 90 users, P95/P99 remained around 10000/11000 ms.
+This is consistent with requests waiting in one or more queues, but the repository does
+not contain CPU throttled time, per-Pod CPU samples during the run, executor wait time,
+YOLO duration, takephoto latency, Redis latency, or per-endpoint failure breakdown.
+Therefore, CPU-bound YOLO is a strong hypothesis and a plausible contributor, not a
+uniquely proven primary bottleneck. Node-level `kubectl top` output taken after a test
+also cannot disprove Pod-level throttling or queueing during the test.
+
+The next experiment should compare `INFERENCE_WORKERS=1`, `2`, and `4` at fixed user
+loads and test duration, while collecting per-Pod CPU usage and cgroup throttling,
+executor wait time, YOLO duration, takephoto latency, Redis latency, and the complete
+cache event counters. A bounded inference queue with a deadline can return 429/503
+during overload instead of allowing requests to reach the 10-second client timeout.
+The `2*n` fan-out should be bounded or processed in batches. Redis single-flight should
+also cover cold misses if duplicate cross-Pod inference is confirmed. Takephoto should
+be monitored and scaled independently, and HPA should consider inference queue depth
+as well as CPU. The acceptable failure-rate threshold should be stated explicitly when
+defining sustainable capacity.
 
 ### Performance Analysis 中文翻译
 
-测试结果表明，系统在扩展到两个 Pod 之后，扩展收益逐渐降低。可接受失败率下的
-最大容量从一个 Pod 的 35 个用户提高到两个 Pod 的 80 个用户，但扩展到四个和八个
-Pod 后仍然维持在 80 个用户。在 80 个用户负载下，平均响应时间从两个 Pod 的
-3378.76 ms 降低到四个 Pod 的 3244.43 ms，改善幅度只有 3.98%；增加到八个 Pod
-后变为 3255.71 ms，没有进一步改善。在 90 个用户负载下，平均响应时间从两个
-Pod 的 3809.77 ms 降低到八个 Pod 的 3509.26 ms，总体只改善 7.89%。因此，增加
-副本数量并没有带来线性的吞吐量或延迟改善。每个 Pod 的容量也随之下降：两个 Pod
-时平均每个 Pod 支持 40 个用户，四个 Pod 时为 20 个，八个 Pod 时仅为 10 个。相对
-一个 Pod 计算出的两个 Pod 的 114.3% 扩展效率不应被解释为真正的超线性扩展，因为
-测试点较为粗略，并且结果可能受到缓存状态和不同测试运行情况的影响。
+测试结果表明，系统在扩展到两个 Pod 后收益明显降低，但这不等于 Kubernetes
+Node 的总 CPU 已经耗尽。可接受失败率下的测试容量从一个 Pod 的 35 个用户提高到
+两个 Pod 的 80 个用户，而四个和八个 Pod 的测试上限仍约为 80 个用户。在 80 个
+用户负载下，平均响应时间从两个 Pod 的 3378.76 ms 降低到四个 Pod 的 3244.43 ms，
+改善约 3.98%；增加到八个 Pod 后为 3255.71 ms，比四个 Pod 慢约 0.35%，基本属于
+测试波动范围。在 90 个用户负载下，平均响应时间从两个 Pod 的 3809.77 ms 降低到
+八个 Pod 的 3509.26 ms，总体只改善 7.89%。因此，增加副本数量没有带来线性的
+吞吐量或延迟改善。所谓每个 Pod 的容量从 40、20 降到 10 个用户，只是将约 80 个
+用户的平台期除以 Pod 数量，并不表示单个 Pod 的真实性能一定变差。两个 Pod 相对
+一个 Pod 的 114.3% 扩展效率也不应解释为真正的超线性扩展，因为测试点、缓存状态、
+请求分布和不同运行之间的波动都会影响这个估算。
 
-系统的主要瓶颈是 CPU 密集型的 YOLO 推理。每个 Pod 配置了四个推理线程，但
-Kubernetes 对每个 Pod 的 CPU 限制只有两个 CPU，因此多个工作线程可能竞争 CPU，
-任务也可能在执行器队列中等待。此外，`find-carparks(n=10)` 会使用
-`asyncio.gather` 并发处理最多 20 个停车场；一次请求最多触发 20 次相机图片获取和
-YOLO 推理。在并发负载下，这种扇出会进一步放大资源竞争。FastAPI 的异步路由和
-`run_in_executor` 避免了 YOLO 阻塞事件循环，但无法消除 CPU 竞争。缓存未命中时，
-请求还依赖共享的 takephoto 服务。L1 缓存、Redis L2 缓存和每个 Pod 内的
-single-flight 机制可以减少重复工作，但 L1/L2 同时未命中时没有跨 Pod 锁，因此多个
-Pod 可能同时获取并推理同一个停车场。Redis 数据传输以及标注 PNG 的 Base64 序列化
-也会产生额外开销。当前的性能平台与这些限制相符，但还需要 CPU throttling、执行器
-等待时间、依赖服务延迟和缓存命中率等指标，才能确定每个因素的具体影响。
+现有证据更支持“端到端排队或共享依赖达到瓶颈”，而不是“Node 总资源不足”。每个
+API Pod 的 CPU limit 是 2，而默认 YOLO 执行器有 4 个推理 worker。4 个 worker
+并不意味着一个 Pod 拥有 4 个 CPU；多个推理任务到达时，worker 可能发生 CPU
+竞争、Pod cgroup throttling 或执行器排队。此外，`find-carparks(n=10)` 会随机抽样
+最多 20 个停车场，并通过 `asyncio.gather` 并发分析。每个冷缓存或过期缓存分析都
+可能需要一次相机请求和一次 YOLO 推理。Locust 中 `find-carparks` 与
+`annotate-carpark` 权重相同，两类请求的客户端超时都是 10 秒。FastAPI 异步路由和
+`run_in_executor` 可以避免 YOLO 阻塞事件循环，但无法消除 CPU 竞争或下游排队。
+同时，所有冷 miss 和 refresh 都依赖共享的 takephoto 服务，因此它也可能成为扩容
+后的共享瓶颈。L1、Redis L2 和每个 Pod 内的 single-flight 能减少重复工作，但冷的
+L1/L2 miss 没有跨 Pod 分布式锁，多个 Pod 仍可能同时获取并推理同一个停车场。
 
-缓解措施首先应当使推理并发数与可用 CPU 相匹配。可以分别测试
-`INFERENCE_WORKERS=1`、`2` 和 `4`，然后根据结果将线程数匹配到当前 CPU 限制，或者
-增加 CPU 资源。应加入带截止时间的有界 semaphore 或队列，使系统过载时返回 429/503，
-而不是让请求一直等待到 Locust 的 10 秒超时。`2*n` 的任务扇出也应设置上限或分批
-处理。此外，Redis single-flight 机制应覆盖冷缓存未命中的情况，使只有一个 Pod 执行
-重复推理，其他 Pod 短暂等待 L2 结果。如果 takephoto 服务达到并发或延迟上限，应对其
-进行监控和扩容；同时，可以将停车位统计元数据与较大的 PNG 数据分开缓存，以减少缓存
-传输成本。最后，HPA 除 CPU 使用率外，还应考虑推理队列深度。每组实验也应重复进行，
-并记录 RPS、延迟百分位数、CPU throttling、依赖服务延迟和缓存命中率。
+之前两 Pod 的缓存日志提供了有价值的佐证：L1 hit 为 34,046，L2 hit 为 749，miss
+为 442，合计缓存命中率约 98.75%，其中 L1 是主要命中层。这说明缓存确实减少了
+重复图片获取和推理，但不能据此认为推理负载可以忽略。因为其中有 4,910 次 L1 hit
+和 146 次 L2 hit 标记为 `refresh=True`。这类请求会立即返回旧值，同时可能在后台
+启动刷新，因此 `cache hit` 不等于“没有 YOLO 工作”。判断真实刷新和推理压力时，
+应重点统计 `inference refresh started`、`cache write | level=L1/L2`、
+`reason=lock-held` 和 `reason=l2-updated`。目前保存的汇总没有列出这些计数，所以
+还不能从现有摘要准确计算实际推理次数。
+
+压测表还显示尾部延迟已经接近 Locust 的超时边界：80 个用户时，两个、四个、八个
+Pod 的 P95/P99 分别约为 9200/10000 ms、8800/10000 ms 和 8900/10000 ms；90 个
+用户时仍约为 10000/11000 ms。这与请求在某个队列中等待的解释一致，但目前没有
+压测期间的 Pod CPU、CPU throttled time、executor 等待时间、YOLO 耗时、takephoto
+延迟、Redis 延迟或按端点拆分的失败数据。因此，CPU 密集型 YOLO 是很强且合理的
+候选瓶颈，但不能说已经被现有实验唯一证明为主瓶颈。压测结束后查看的 Node 级
+`kubectl top` 也不能排除压测期间的 Pod 级 throttling 或执行器排队。
+
+下一轮实验应在固定用户数和测试时长下比较 `INFERENCE_WORKERS=1`、`2`、`4`，并
+同时记录每个 Pod 的 CPU 使用率和 cgroup throttling、executor 等待时间、YOLO
+耗时、takephoto 延迟、Redis 延迟以及完整的缓存事件计数。如果确认存在过载排队，
+可以加入带截止时间的有界推理队列，在达到上限时返回 429/503，避免请求一直等待到
+Locust 的 10 秒超时；`2*n` 的任务扇出也应设置上限或分批处理。如果日志证明冷 miss
+造成跨 Pod 重复推理，再让 Redis single-flight 覆盖冷 miss。最后，takephoto 应独立
+监控和扩容，HPA 除 CPU 外还应考虑推理队列深度，并明确“可接受失败率”的阈值后再
+定义 sustainable capacity。
+
 
 ## 15. Dashboard 与缓存分析图片
 
