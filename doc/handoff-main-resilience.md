@@ -564,6 +564,75 @@ Logging 导出到可查询存储；这会增加写入量、查询复杂度和成
     并将空位、置信度和 `created_at` 返回为 `null`。
 - 缓存和 in-flight 表都是单进程/单 Pod 内存状态。不同 GKE 副本之间不能互相复用。
 
+## Performance Analysis
+
+The results show diminishing returns after two Pods. Sustainable capacity rises from 35
+users with one Pod to 80 with two Pods, but remains at 80 for four and eight Pods. At 80
+users, average latency changes from 3378.76 ms (two Pods) to 3244.43 ms (four) and
+3255.71 ms (eight): four Pods improve latency by only 3.98%, while eight provide no
+further improvement. At 90 users, scaling from two to eight Pods reduces latency from
+3809.77 ms to 3509.26 ms, only 7.89%. Capacity per Pod consequently falls from 40 users
+with two Pods to 20 with four and 10 with eight. The apparent 114.3% efficiency of two
+Pods relative to one is likely caused by coarse test points, cache state, and run
+variation rather than true super-linear scaling.
+
+The primary bottleneck is CPU-bound YOLO inference. Each Pod has four inference threads
+but a two-CPU Kubernetes limit, so workers compete for CPU and tasks can queue. Moreover,
+`find-carparks(n=10)` concurrently fans out to as many as 20 camera fetches and YOLO
+tasks. FastAPI's asynchronous routes and `run_in_executor` prevent YOLO from blocking the
+event loop, but cannot remove CPU contention. Cold requests also depend on the shared
+takephoto service. L1/Redis L2 caching and per-Pod single-flight reduce repeated work,
+but cold L1/L2 misses lack a cross-Pod lock, allowing several Pods to fetch and infer the
+same car park. Redis transfer and Base64 serialization of annotated PNGs add overhead.
+The measured plateau is consistent with these constraints, although CPU throttling,
+executor wait time, dependency latency, and cache-hit metrics are needed to identify
+their individual impact.
+
+Mitigation should first benchmark `INFERENCE_WORKERS=1`, `2`, and `4`, then match worker
+count to the CPU limit or allocate additional CPU. A bounded semaphore/queue with a
+deadline should return 429/503 during overload instead of allowing requests to wait for
+Locust's 10-second timeout. The `2*n` fan-out should be bounded or processed in batches,
+and Redis single-flight should cover cold misses so only one Pod performs duplicate
+work. Takephoto should be monitored and scaled if saturated, while occupancy metadata
+should be cached separately from large PNG payloads. Finally, HPA should consider
+inference queue depth as well as CPU, and each experiment should be repeated while
+recording RPS, latency percentiles, CPU throttling, dependency latency, and cache hits.
+
+### Performance Analysis 中文翻译
+
+测试结果表明，系统在扩展到两个 Pod 之后，扩展收益逐渐降低。可接受失败率下的
+最大容量从一个 Pod 的 35 个用户提高到两个 Pod 的 80 个用户，但扩展到四个和八个
+Pod 后仍然维持在 80 个用户。在 80 个用户负载下，平均响应时间从两个 Pod 的
+3378.76 ms 降低到四个 Pod 的 3244.43 ms，改善幅度只有 3.98%；增加到八个 Pod
+后变为 3255.71 ms，没有进一步改善。在 90 个用户负载下，平均响应时间从两个
+Pod 的 3809.77 ms 降低到八个 Pod 的 3509.26 ms，总体只改善 7.89%。因此，增加
+副本数量并没有带来线性的吞吐量或延迟改善。每个 Pod 的容量也随之下降：两个 Pod
+时平均每个 Pod 支持 40 个用户，四个 Pod 时为 20 个，八个 Pod 时仅为 10 个。相对
+一个 Pod 计算出的两个 Pod 的 114.3% 扩展效率不应被解释为真正的超线性扩展，因为
+测试点较为粗略，并且结果可能受到缓存状态和不同测试运行情况的影响。
+
+系统的主要瓶颈是 CPU 密集型的 YOLO 推理。每个 Pod 配置了四个推理线程，但
+Kubernetes 对每个 Pod 的 CPU 限制只有两个 CPU，因此多个工作线程可能竞争 CPU，
+任务也可能在执行器队列中等待。此外，`find-carparks(n=10)` 会使用
+`asyncio.gather` 并发处理最多 20 个停车场；一次请求最多触发 20 次相机图片获取和
+YOLO 推理。在并发负载下，这种扇出会进一步放大资源竞争。FastAPI 的异步路由和
+`run_in_executor` 避免了 YOLO 阻塞事件循环，但无法消除 CPU 竞争。缓存未命中时，
+请求还依赖共享的 takephoto 服务。L1 缓存、Redis L2 缓存和每个 Pod 内的
+single-flight 机制可以减少重复工作，但 L1/L2 同时未命中时没有跨 Pod 锁，因此多个
+Pod 可能同时获取并推理同一个停车场。Redis 数据传输以及标注 PNG 的 Base64 序列化
+也会产生额外开销。当前的性能平台与这些限制相符，但还需要 CPU throttling、执行器
+等待时间、依赖服务延迟和缓存命中率等指标，才能确定每个因素的具体影响。
+
+缓解措施首先应当使推理并发数与可用 CPU 相匹配。可以分别测试
+`INFERENCE_WORKERS=1`、`2` 和 `4`，然后根据结果将线程数匹配到当前 CPU 限制，或者
+增加 CPU 资源。应加入带截止时间的有界 semaphore 或队列，使系统过载时返回 429/503，
+而不是让请求一直等待到 Locust 的 10 秒超时。`2*n` 的任务扇出也应设置上限或分批
+处理。此外，Redis single-flight 机制应覆盖冷缓存未命中的情况，使只有一个 Pod 执行
+重复推理，其他 Pod 短暂等待 L2 结果。如果 takephoto 服务达到并发或延迟上限，应对其
+进行监控和扩容；同时，可以将停车位统计元数据与较大的 PNG 数据分开缓存，以减少缓存
+传输成本。最后，HPA 除 CPU 使用率外，还应考虑推理队列深度。每组实验也应重复进行，
+并记录 RPS、延迟百分位数、CPU throttling、依赖服务延迟和缓存命中率。
+
 ## 15. Dashboard 与缓存分析图片
 
 > 更新日期:2026-09-05。
