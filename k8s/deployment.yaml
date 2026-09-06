@@ -53,7 +53,7 @@ spec:
             - name: FIRESTORE_DATABASE
               value: "fit3184-a1"
             - name: INFERENCE_WORKERS
-              value: "2"
+              value: "1"
             - name: REQUEST_CACHE_TTL
               value: "30"
             - name: REQUEST_CACHE_REFRESH_AFTER
