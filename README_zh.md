@@ -84,6 +84,7 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
    - 两级缓存都使用 `REQUEST_CACHE_TTL`（默认 30 秒）。L2 命中直接返回，不回填 L1，因此不会因为 L2 命中而延长原始缓存生命周期。
    - 缓存达到 `REQUEST_CACHE_REFRESH_AFTER`（默认 20 秒）后，当前请求立即返回仍有效的旧数据，同时尝试后台刷新。
    - Redis 模式使用 `REQUEST_CACHE_REFRESH_LOCK_TTL`（默认 30 秒）和每个停车场一把带 token 的锁，避免多个 Pod 重复后台刷新。Firestore 模式不会访问 Redis，仍保持原来的 L1-only 行为。
+   - Kubernetes Redis 清单将 Redis `--maxmemory` 设置为 `3gb`，容器 memory limit 设置为 `4Gi`。`gb` 是 Redis 自身配置使用的单位，`Gi` 是 Kubernetes resource quantity；剩余内存留给 Redis 进程开销、客户端缓冲区和内存分配器碎片。
 
 ## 在 GKE 上统计缓存
 

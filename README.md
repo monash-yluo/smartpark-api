@@ -135,6 +135,10 @@ MODEL_PATH to the model.pt / model.onnx file.
        token-safe per-car-park lock to prevent duplicate background refreshes across
        Pods. Firestore mode does not contact Redis and keeps the original L1-only
        behavior.
+    - The Kubernetes Redis manifest sets Redis `--maxmemory 3gb` under a `4Gi`
+       container memory limit. Redis uses `gb` in its own configuration, while
+       Kubernetes resource quantities use `Gi`. The remaining memory is reserved for
+       Redis process overhead, client buffers, and allocator fragmentation.
 
 ## Cache statistics on GKE
 

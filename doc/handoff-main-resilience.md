@@ -47,10 +47,10 @@
     `/api/ops/users` 在 Redis 后端不可用时返回 503。
 - API `/healthz` 只用于自身 liveness/readiness，不依赖 Redis，避免 Redis 故障把所有
     API Pod 从 Service 摘除。`/healthz/dependencies` 独立报告 Redis 和 Firestore 状态。
-- 当前 `k8s/redis.yaml` 的 Pod memory limit 是 4 GiB，但 Redis 启动参数仍为
-    `--maxmemory 128mb`；图片 L2 实际最多使用约 128 MB，并由 `allkeys-lru` 淘汰。
-    `allkeys-lru` 也可能淘汰活跃用户 ZSET。后续若图片大小/基数需要更多容量，应明确
-    调整 `--maxmemory`，而不能只提高 Kubernetes memory limit。
+- 当前 `k8s/redis.yaml` 将 Redis 启动参数设置为 `--maxmemory 3gb`，Pod memory
+    limit 设置为 `4Gi`。Redis 配置使用 `gb`，Kubernetes resource quantity 使用
+    `Gi`；这里的 `3gb` 等于 3 GiB，为 Redis 进程开销、客户端缓冲区和内存碎片保留
+    约 1 GiB。达到数据上限后由 `allkeys-lru` 淘汰键，该策略也可能淘汰活跃用户 ZSET。
 
 ## 背景
 
