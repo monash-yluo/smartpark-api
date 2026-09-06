@@ -1,38 +1,68 @@
+# 使用 apps/v1 版本的 Deployment API。 / Use the apps/v1 Deployment API.
 apiVersion: apps/v1
+# 定义用于管理无状态应用副本的 Deployment。 / Define a Deployment that manages stateless application replicas.
 kind: Deployment
 metadata:
+  # Deployment 的名称。 / Name of the Deployment.
   name: smartpark-api
 spec:
+  # 期望运行的 API Pod 数量。 / Desired number of API pods.
   replicas: 1
+  # 指定此 Deployment 管理带有 app=smartpark-api 标签的 Pod。 / Manage pods labeled app=smartpark-api.
   selector:
     matchLabels:
       app: smartpark-api
+  # 定义 Deployment 创建的 Pod 模板。 / Define the pod template created by this Deployment.
   template:
     metadata:
+      # Pod 标签必须与上方 selector 匹配。 / Pod labels must match the selector above.
       labels:
         app: smartpark-api
     spec:
+      # 优先将 API 副本分散到不同节点以提高可用性。 / Prefer spreading API replicas across nodes for availability.
+      # 这是软约束；资源不足时多个 Pod 仍可位于同一节点。 / This is a soft constraint, so pods may share a node when capacity is limited.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            # 使用最高偏好权重应用此分散规则。 / Apply this spreading preference with the highest weight.
+            - weight: 100
+              podAffinityTerm:
+                # 以 Kubernetes 节点主机名作为分散范围。 / Use the Kubernetes node hostname as the topology domain.
+                topologyKey: kubernetes.io/hostname
+                # 匹配本 Deployment 创建的 API Pod。 / Match API pods created by this Deployment.
+                labelSelector:
+                  matchLabels:
+                    app: smartpark-api
+      # 声明模型临时存储卷和停车场配置卷。 / Declare volumes for temporary model storage and car park configuration.
       volumes:
+        # Pod 生命周期内保存下载的模型文件。 / Store the downloaded model file for the lifetime of the pod.
         - name: model-data
           emptyDir: {}
+        # 从 ConfigMap smartpark-carparks 读取停车场配置。 / Read car park configuration from the smartpark-carparks ConfigMap.
         - name: carparks-config
           configMap:
             name: smartpark-carparks
+      # 主容器启动前下载并验证模型。 / Download and validate the model before the main container starts.
       initContainers:
         - name: download-model
+          # 使用包含 gsutil 的轻量 Google Cloud CLI 镜像。 / Use the slim Google Cloud CLI image that includes gsutil.
           image: gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
           env:
+            # 从 ConfigMap 获取 Cloud Storage 模型 URI。 / Load the Cloud Storage model URI from a ConfigMap.
             - name: MODEL_URI
               valueFrom:
                 configMapKeyRef:
                   name: smartpark-model-config
                   key: MODEL_URI
+          # 在 shell 中执行模型下载命令。 / Run the model download command in a shell.
           command: ["/bin/sh", "-c"]
           args:
+            # 出错时立即退出，下载模型并确认文件非空。 / Exit on errors, download the model, and verify that it is not empty.
             - >-
               set -eu;
               gsutil cp "${MODEL_URI}" /data/model.pt;
               test -s /data/model.pt
+          # 将模型卷挂载到下载目录。 / Mount the model volume at the download directory.
           volumeMounts:
             - name: model-data
               mountPath: /data
@@ -81,7 +111,7 @@ spec:
               port: http
           resources:
             requests:
-              cpu: 1500m
+              cpu: 1000m
               memory: 1Gi
             limits:
               cpu: "2"
