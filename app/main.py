@@ -87,21 +87,21 @@ async def lifespan(app: FastAPI):
     app.state.cache = TTLCache(default_ttl=config.request_cache_ttl_s)
     app.state.inflight_analyses = {}
     app.state.inflight_analyses_lock = asyncio.Lock()
-    app.state.user_activity = build_user_activity_store()
-    activity_store_name = type(app.state.user_activity).__name__.removesuffix("Store").lower()
-    if not app.state.user_activity.enabled:
-        log.info("%s status | enabled=false | reachable=not-checked", activity_store_name)
+    app.state.shared_store = build_user_activity_store()
+    shared_store_name = type(app.state.shared_store).__name__.removesuffix("Store").lower()
+    if not app.state.shared_store.enabled:
+        log.info("%s status | enabled=false | reachable=not-checked", shared_store_name)
     else:
         try:
-            await app.state.user_activity.check_connection()
+            await app.state.shared_store.check_connection()
         except Exception as exc:  # noqa: BLE001 - Firestore is an optional operational dependency
             log.warning(
                 "%s status | enabled=true | reachable=false | error=%s",
-                activity_store_name,
+                shared_store_name,
                 exc,
             )
         else:
-            log.info("%s status | enabled=true | reachable=true", activity_store_name)
+            log.info("%s status | enabled=true | reachable=true", shared_store_name)
     # The model is loaded from disk at runtime (MODEL_PATH). If it is not
     # available (e.g. local dev), build_detector returns a MockDetector so the
     # endpoints still boot and can be tested. On GKE, MODEL_PATH points at the
@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI):
         await _shutdown_inflight_analyses(app)
     finally:
         await app.state.http.aclose()
-        await app.state.user_activity.close()
+        await app.state.shared_store.close()
 
 
 app = FastAPI(title="smartpark-api", version="1.0.0", lifespan=lifespan)
@@ -289,9 +289,11 @@ async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
 
     app.state.cache.set(cache_key, analysis)
     log.info("cache write | level=L1 | carpark=%s", carpark.id)
-    if isinstance(app.state.user_activity, RedisStore):
+    # 启动时由 USER_ACTIVITY_STORE 选择后端；只有 Redis 支持共享 L2 分析缓存，Firestore 会跳过此分支。
+    # USER_ACTIVITY_STORE selects the backend at startup; only Redis provides the shared L2 analysis cache.
+    if isinstance(app.state.shared_store, RedisStore):
         try:
-            await app.state.user_activity.set_analysis(
+            await app.state.shared_store.set_analysis(
                 carpark.id,
                 analysis,
                 app.state.config.request_cache_ttl_s,
@@ -304,7 +306,7 @@ async def _load_and_cache_carpark_analysis(carpark: CarPark) -> dict | None:
 
 async def _refresh_carpark_analysis_with_lock(carpark: CarPark) -> dict | None:
     """Refresh one car park only when this Pod owns its Redis refresh lock."""
-    store = app.state.user_activity
+    store = app.state.shared_store
     if not isinstance(store, RedisStore):
         return await _load_and_cache_carpark_analysis(carpark)
 
@@ -415,9 +417,9 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
             await _get_or_start_analysis_task(carpark, refresh=True)
         return cached.value
 
-    if isinstance(app.state.user_activity, RedisStore):
+    if isinstance(app.state.shared_store, RedisStore):
         try:
-            shared_cached = await app.state.user_activity.get_analysis(
+            shared_cached = await app.state.shared_store.get_analysis(
                 carpark.id,
                 app.state.config.request_cache_refresh_after_s,
             )
@@ -447,7 +449,7 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
         task = app.state.inflight_analyses.get(carpark.id)
         if task is None:
             checked_levels = (
-                "L1,L2" if isinstance(app.state.user_activity, RedisStore) else "L1"
+                "L1,L2" if isinstance(app.state.shared_store, RedisStore) else "L1"
             )
             log.info(
                 "cache miss | levels=%s | carpark=%s | action=inference",
@@ -568,7 +570,7 @@ async def find_carparks(
         "results": top,
     }
     try:
-        await app.state.user_activity.record_user(user_id)
+        await app.state.shared_store.record_user(user_id)
     except Exception as exc:  # noqa: BLE001 - telemetry must not break core API
         log.error("User activity write failed: %s", exc)
     return payload
@@ -607,7 +609,7 @@ async def annotate_carpark(
     # 车场存在后即为一次有效的 CORE-API-2 调用.在处理前记录,这样即使拉图/分析失败,
     # 该用户仍会计入 OPS-API-2(最近 30 秒不同用户数).
     try:
-        await app.state.user_activity.record_user(user_id)
+        await app.state.shared_store.record_user(user_id)
     except Exception as exc:  # noqa: BLE001 - telemetry must not break core API
         log.error("User activity write failed: %s", exc)
 
@@ -723,7 +725,7 @@ async def ops_carpark_image(carpark_id: str):
 @app.get("/api/ops/users")
 async def ops_users():
     """统计最近 30 秒访问过有效 API 的不同用户数量。"""
-    store = app.state.user_activity
+    store = app.state.shared_store
     store_name = type(store).__name__.removesuffix("Store").lower()
     if not store.enabled:
         return JSONResponse(

@@ -7,12 +7,13 @@
 
 ## 当前实现摘要
 
-当前代码已经实现按配置切换的用户活动后端和条件式两级分析缓存：
+当前代码已经实现按配置切换的共享用户统计后端和条件式两级分析缓存。运行时对象命名为
+`app.state.shared_store`，因为 Redis 除共同的用户统计接口外还提供 L2 缓存和 refresh lock：
 
 - `USER_ACTIVITY_STORE=redis`：活跃用户统计使用 Redis ZSET；分析缓存读取顺序为
     L1 本地 `TTLCache` -> L2 Redis -> 摄像头/推理。推理成功后双写 L1/L2。
-- `USER_ACTIVITY_STORE=firestore`：保留 Firestore 用户统计；分析缓存只使用原来的
-    L1，不访问 Redis，保证回退行为与之前一致。
+- `USER_ACTIVITY_STORE=firestore`：保留 Firestore 用户统计；Firestore 不实现分析缓存或
+    refresh lock，分析只使用原来的 L1，不访问 Redis，保证回退行为与之前一致。
 - L1/L2 TTL 都使用 `REQUEST_CACHE_TTL`，默认 30 秒；L2 命中不回填 L1，避免
     Redis 命中后重新获得一个完整 L1 TTL、意外延长数据年龄。
 - `REQUEST_CACHE_REFRESH_AFTER` 默认 20 秒。进入刷新窗口时立即返回当前数据，并

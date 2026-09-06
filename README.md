@@ -65,7 +65,7 @@ MODEL_PATH to the model.pt / model.onnx file.
    (default 20; must be greater than 0 and less than REQUEST_CACHE_TTL)
 - REQUEST_CACHE_REFRESH_LOCK_TTL  Redis refresh-lock TTL seconds (default 30;
    set above the expected camera-fetch plus inference duration)
-- USER_ACTIVITY_STORE  shared active-user backend: `redis` or `firestore`
+- USER_ACTIVITY_STORE  shared active-user counting backend: `redis` or `firestore`
    (default `firestore`, used by the GKE manifest)
 - REDIS_URL       Redis connection URL (default `redis://redis-service:6379/0`)
 - REDIS_TIMEOUT   Redis connect/read timeout seconds (default `2`)
@@ -91,10 +91,11 @@ MODEL_PATH to the model.pt / model.onnx file.
    annotated image) is cached by car-park ID for the TTL, so all endpoints reuse it.
    OPS-API-1 exposes each successful entry's `created_at` in UTC ISO 8601 format.
    The operator image endpoint reuses the cached annotated PNG. When Redis is the
-   selected activity backend, Redis also acts as an L2 analysis cache shared by all
+   selected user-counting backend, Redis also acts as an L2 analysis cache shared by all
    Pods: reads check local L1 first and then Redis, while inference writes both with
    the same TTL. An L2 hit is returned without extending or backfilling L1. With the
-   Firestore backend, analysis caching remains local-only as before. Redis mode also
+   Firestore implements only the common user-counting capability, not the L2 analysis
+   cache or refresh lock, so analysis caching remains local-only in Firestore mode. Redis also
    coordinates background refreshes with one token-safe lock per car park. A Pod
    that does not acquire the lock returns the current cache without starting YOLO;
    the owner rechecks L2 before inference in case another Pod already refreshed it.

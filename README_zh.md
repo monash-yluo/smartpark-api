@@ -59,7 +59,7 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 - REQUEST_CACHE_REFRESH_AFTER  缓存达到该年龄后启动后台刷新
    （默认 20；必须大于 0 且小于 REQUEST_CACHE_TTL）
 - REQUEST_CACHE_REFRESH_LOCK_TTL  Redis 刷新锁 TTL（秒，默认 30；应高于摄像头拉取与推理的预计总耗时）
-- USER_ACTIVITY_STORE  共享用户活动后端：`redis` 或 `firestore`
+- USER_ACTIVITY_STORE  共享用户统计后端：`redis` 或 `firestore`
    （默认 `firestore`；GKE 清单使用 `redis`）
 - REDIS_URL       Redis 连接 URL（默认 `redis://redis-service:6379/0`）
 - REDIS_TIMEOUT   Redis 连接/读取超时秒数（默认 `2`）
@@ -72,7 +72,7 @@ OPS-REQ-2（运维仪表板）可通过 `/dashboard/` 访问。页面由 FastAPI
 2. 可更新模型。模型权重**不会**复制到镜像中。在 GKE 上，initContainer 会将选定的 GCS 对象下载到共享的 `emptyDir` 卷中，应用通过 `MODEL_PATH=/data/model.pt` 读取该文件。修改 ConfigMap 中的模型 URI 并重启 Deployment 后，新 Pod 就会加载新模型，无需重新构建应用镜像。
 3. 推理不会阻塞事件循环。YOLO 是同步且 CPU 密集型的，因此会通过 `loop.run_in_executor` 在 ThreadPoolExecutor 中运行；路由只需等待其结果（见 app/inference.py）。这是核心的“瓶颈 + 缓解措施”要点。
 4. 2n 采样 + 并发执行。find-carparks 会采样 2*n 个停车场，并发拉取图片和执行推理（`asyncio.gather`），然后按空闲车位数返回前 n 个停车场。
-5. 每个停车场的推理缓存。成功的分析结果（计数、置信度和带标注图片）会按停车场 ID 缓存指定 TTL，因此所有接口都可以复用该结果。OPS-API-1 会把成功缓存条目的 `created_at` 以 UTC ISO 8601 格式返回；运维图片接口直接复用缓存中的标注 PNG。选择 Redis 用户活动后端时，Redis 同时作为所有 Pod 共享的 L2 分析缓存：读取顺序为本地 L1、Redis L2、推理，推理成功后以相同 TTL 双写 L1 和 L2。L2 命中直接返回而不回填或续期 L1。后台刷新使用每个停车场一把带 token 的 Redis 锁协调；没有拿到锁的 Pod 直接返回当前缓存而不启动 YOLO，锁持有者在推理前再次检查 L2，避免其他 Pod 已完成刷新后重复推理。冷的 L1/L2 同时 miss 仍不加锁，偶尔可能并发推理。选择 Firestore 后端时仍只使用原有 L1 缓存。
+5. 每个停车场的推理缓存。成功的分析结果（计数、置信度和带标注图片）会按停车场 ID 缓存指定 TTL，因此所有接口都可以复用该结果。OPS-API-1 会把成功缓存条目的 `created_at` 以 UTC ISO 8601 格式返回；运维图片接口直接复用缓存中的标注 PNG。选择 Redis 用户统计后端时，Redis 同时作为所有 Pod 共享的 L2 分析缓存：读取顺序为本地 L1、Redis L2、推理，推理成功后以相同 TTL 双写 L1 和 L2。L2 命中直接返回而不回填或续期 L1。后台刷新使用每个停车场一把带 token 的 Redis 锁协调；没有拿到锁的 Pod 直接返回当前缓存而不启动 YOLO，锁持有者在推理前再次检查 L2，避免其他 Pod 已完成刷新后重复推理。冷的 L1/L2 同时 miss 仍不加锁，偶尔可能并发推理。Firestore 只实现共同的用户统计能力，不提供 L2 分析缓存或 refresh lock，因此选择 Firestore 时仍只使用原有 L1 缓存。
 6. 较大的 n（假设场景）。n 会被限制为停车场数量，最多只采样 2*n 个停车场，因此巨大的 n（例如 200）不会被滥用来请求摄像头或副本。
 7. 共享的运营用户统计。当 `USER_ACTIVITY_STORE=redis` 时，OPS-API-2 使用共享 Redis ZSET，以用户为 member、最后访问时间为 score。GKE 清单运行一个集群内 Redis Pod。保留 Firestore 作为回退方案：设置 `USER_ACTIVITY_STORE=firestore` 即可切回；选定的存储不可用时接口返回 503，而不是报告误导性的单 Pod 统计数字。
 8. 用户身份：uuid 优先，IP 作为回退。平台需要稳定的 ID，以便将同一用户的请求归组（用于日志和 OPS-API-2 用户统计）。如果客户端提供 uuid，就使用 `user:<uuid>`；否则回退到客户端 IP（`ip:<client_ip>`），这样一个用户发起多次请求（例如多次 annotate 调用）时只会计为一个用户，而不是多个用户。原始用户 uuid 仍会在 find-carparks 响应中原样返回。在代理 / 负载均衡器（GKE Ingress、Cloud Run）后方，我们从 X-Forwarded-For 读取真实客户端地址（取最左侧的值）；否则使用直接对端地址（见 app/logging_utils.py）。

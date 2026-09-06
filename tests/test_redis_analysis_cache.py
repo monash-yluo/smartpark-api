@@ -100,7 +100,7 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         store.get_analysis = AsyncMock(
             return_value=CacheLookup(shared_analysis, should_refresh=False)
         )
-        app.state.user_activity = store
+        app.state.shared_store = store
         app.state.cache = TTLCache(default_ttl=30)
         app.state.config = SimpleNamespace(request_cache_refresh_after_s=20)
         app.state.inflight_analyses = {}
@@ -126,7 +126,7 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         store.get_analysis = AsyncMock(
             return_value=CacheLookup(shared_analysis, should_refresh=False)
         )
-        app.state.user_activity = store
+        app.state.shared_store = store
         app.state.cache = TTLCache(default_ttl=30)
         app.state.config = SimpleNamespace(
             carparks=(carpark,),
@@ -160,7 +160,7 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         store = RedisStore()
         store.get_analysis = AsyncMock(return_value=None)
         store.set_analysis = AsyncMock()
-        app.state.user_activity = store
+        app.state.shared_store = store
         app.state.cache = TTLCache(default_ttl=30)
         app.state.config = SimpleNamespace(
             request_cache_refresh_after_s=20,
@@ -188,7 +188,7 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         store = RedisStore()
         store.acquire_refresh_lock = AsyncMock(return_value=None)
         store.release_refresh_lock = AsyncMock()
-        app.state.user_activity = store
+        app.state.shared_store = store
         app.state.config = SimpleNamespace(request_cache_refresh_lock_ttl_s=30)
 
         with patch(
@@ -215,7 +215,7 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         store.get_analysis = AsyncMock(
             return_value=CacheLookup(refreshed, should_refresh=False)
         )
-        app.state.user_activity = store
+        app.state.shared_store = store
         app.state.config = SimpleNamespace(
             request_cache_refresh_after_s=20,
             request_cache_refresh_lock_ttl_s=30,
@@ -241,7 +241,7 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         store.get_analysis = AsyncMock(
             return_value=CacheLookup({}, should_refresh=True)
         )
-        app.state.user_activity = store
+        app.state.shared_store = store
         app.state.config = SimpleNamespace(
             request_cache_refresh_after_s=20,
             request_cache_refresh_lock_ttl_s=30,
@@ -270,7 +270,7 @@ class RedisAnalysisCacheTests(unittest.IsolatedAsyncioTestCase):
         previous_enabled = os.environ.get("FIRESTORE_ENABLED")
         os.environ["FIRESTORE_ENABLED"] = "0"
         try:
-            app.state.user_activity = FirestoreStore()
+            app.state.shared_store = FirestoreStore()
         finally:
             if previous_enabled is None:
                 os.environ.pop("FIRESTORE_ENABLED", None)
