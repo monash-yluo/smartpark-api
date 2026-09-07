@@ -224,20 +224,192 @@ Unavailable rows retain the car park ID and name but return `null` for
 `available_spaces`, `confidence_score`, and `created_at`. This distinguishes a
 failed camera or analysis from a car park with zero free spaces.
 
-## Next steps
+## Deploy on GKE (重点)
 
-- GKE manifests (namespace, ConfigMaps, node service-account IAM permission,
-  Deployment, LoadBalancer Service, HPA) and real deployment. The model uses
-  GCS + an initContainer + shared `emptyDir`, rather than a PVC.
+This section matches the manifests currently in this repository. The API
+Deployment references two ConfigMaps: `smartpark-carparks` and
+`smartpark-model-config`. The model ConfigMap is required; if it is omitted, the
+`download-model` initContainer cannot read `MODEL_URI` and the API Pods will not
+become Ready.
 
-## Runtime model deployment
+The `k8s/` directory currently contains the API Deployment, Redis
+Deployment/Service, the model ConfigMap, and the command that generates the car
+park ConfigMap. It does not contain a LoadBalancer Service or HPA manifest, so
+the `kubectl expose` and `kubectl autoscale` commands below create those two
+resources.
 
-The model file is intentionally absent from the Docker build context and image.
-Upload it to a private GCS bucket, set `MODEL_URI` in
-`k8s/model-configmap.yaml`, and grant the GKE node pool service account
-`storage.objects.get` (or `roles/storage.objectViewer`). The Deployment does
-not specify `serviceAccountName`; Pods use the namespace `default` ServiceAccount
-and access GCS through the node identity in the current cluster setup.
+### 1. Set the project and connect to GKE
+
+Install and authenticate `gcloud` and `kubectl`, then enable Artifact Registry,
+GKE, and Cloud Storage APIs:
+
+```bash
+export PROJECT_ID="YOUR_GCP_PROJECT"
+export REGION="australia-southeast2"
+export ZONE="australia-southeast2-a"
+export CLUSTER_NAME="YOUR_GKE_CLUSTER"
+export MODEL_URI="gs://YOUR_BUCKET/model.pt"
+
+gcloud config set project "$PROJECT_ID"
+gcloud container clusters get-credentials "$CLUSTER_NAME" \
+   --zone "$ZONE" --project "$PROJECT_ID"
+kubectl get nodes
+```
+
+For a regional cluster, replace `--zone "$ZONE"` with
+`--region "$REGION"`. Run all following commands from the repository root and
+make sure the current `kubectl` context is the intended cluster.
+
+### 2. Prepare the GCS model and node IAM permission
+
+Model weights are deliberately not baked into the Docker image. Upload the
+model and verify that the object is non-empty:
+
+```bash
+gcloud storage cp model.pt "$MODEL_URI"
+gcloud storage ls -l "$MODEL_URI"
+```
+
+The current Deployment does not set `serviceAccountName`, so the initContainer
+uses the GKE node pool service account to access GCS. Find that account and grant
+the least-privilege object viewer role:
+
+```bash
+NODE_SA=$(gcloud container clusters describe "$CLUSTER_NAME" \
+   --zone "$ZONE" --project "$PROJECT_ID" \
+   --format='value(nodeConfig.serviceAccount)')
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+   --member="serviceAccount:${NODE_SA}" \
+   --role="roles/storage.objectViewer"
+```
+
+For Workload Identity, prefer a Kubernetes ServiceAccount plus an IAM binding
+and set `serviceAccountName` in the Deployment; do not put a service-account
+JSON key in the image or a ConfigMap. Standard clusters using legacy node
+scopes must also allow Cloud Storage access, normally through the
+`cloud-platform` scope when the node pool is created.
+
+### 3. Build and push the API image
+
+Replace the `image` value in `k8s/deployment.yaml` with the image you push:
+
+```bash
+gcloud services enable artifactregistry.googleapis.com container.googleapis.com \
+   storage.googleapis.com
+gcloud auth configure-docker "${REGION}-docker.pkg.dev"
+docker build -t "${REGION}-docker.pkg.dev/${PROJECT_ID}/smartpark/api:v1" .
+docker push "${REGION}-docker.pkg.dev/${PROJECT_ID}/smartpark/api:v1"
+```
+
+Create the Artifact Registry repository first if necessary:
+
+```bash
+gcloud artifacts repositories create smartpark \
+   --repository-format=docker --location="$REGION" \
+   --description="SmartPark container images"
+```
+
+### 4. Apply Kubernetes resources in dependency order
+
+Do not skip the model ConfigMap. After changing `MODEL_URI`, apply it again and
+restart the Deployment so new Pods download the new object:
+
+```bash
+kubectl create configmap smartpark-carparks \
+   --from-file=carparks.json=config/carparks.json \
+   --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl apply -f k8s/model-configmap.yaml
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/deployment.yaml
+
+kubectl rollout status deployment/smartpark-redis
+kubectl rollout status deployment/smartpark-api
+kubectl get pods -l app=smartpark-api -o wide
+```
+
+Confirm that the model ConfigMap is present without printing the model itself:
+
+```bash
+kubectl get configmap smartpark-model-config -o jsonpath='{.data.MODEL_URI}'; echo
+kubectl get pods -l app=smartpark-api
+kubectl describe pod -l app=smartpark-api | grep -A5 -E 'Init Containers|State|Reason'
+```
+
+If the initContainer fails, inspect its logs:
+
+```bash
+kubectl logs -l app=smartpark-api -c download-model --tail=100
+```
+
+Common causes are a wrong model URI, missing `storage.objects.get` permission,
+an incorrect image address, or an empty model object. Only a running API
+container with `detector=real-yolo` confirms that the real model loaded;
+otherwise the application may fall back to `MockDetector`.
+
+### 5. Create the public LoadBalancer and CPU HPA
+
+The API Deployment exposes container port 8000, but this repository currently
+has no Service manifest. Create it with:
+
+```bash
+kubectl expose deployment smartpark-api \
+   --name=smartpark-api-service --type=LoadBalancer \
+   --port=80 --target-port=http
+kubectl get service smartpark-api-service -w
+```
+
+After an `EXTERNAL-IP` is assigned:
+
+```bash
+export API_URL="http://EXTERNAL_IP"
+curl "$API_URL/healthz"
+curl "$API_URL/"
+```
+
+Check that the cluster exposes resource metrics before creating the HPA:
+
+```bash
+kubectl top pods
+```
+
+If metrics are available, create an HPA with 1 to 8 replicas and a 70% CPU
+target:
+
+```bash
+kubectl autoscale deployment smartpark-api \
+   --name=smartpark-api-hpa --cpu-percent=70 --min=1 --max=8
+kubectl get hpa smartpark-api-hpa
+```
+
+The HPA depends on CPU requests, which are already set to `500m` in the
+Deployment. Before load testing, observe the rollout and scaling:
+
+```bash
+kubectl get deployment smartpark-api
+kubectl get hpa smartpark-api-hpa -w
+kubectl get pods -l app=smartpark-api
+```
+
+### 6. Update configuration or the model
+
+After changing `config/carparks.json`, regenerate the car-park ConfigMap. After
+changing the model object, update `k8s/model-configmap.yaml`. Both changes need
+an API rollout because car parks are read at startup and the model is downloaded
+by the initContainer:
+
+```bash
+kubectl create configmap smartpark-carparks \
+   --from-file=carparks.json=config/carparks.json \
+   --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f k8s/model-configmap.yaml
+kubectl rollout restart deployment/smartpark-api
+kubectl rollout status deployment/smartpark-api
+```
+
+Redis is a single, non-persistent store for short-lived operational data. A
+Redis restart clears the last 30 seconds of user activity and the shared
+analysis cache; it does not delete the model or stop the API process.
 
 ### Deploy the in-cluster Redis
 
@@ -334,26 +506,4 @@ detector=real-yolo
 The Base64 image length alone cannot distinguish real YOLO from MockDetector;
 MockDetector returns the original image without drawing detection boxes.
 
-Build and push the lightweight image to Artifact Registry:
-
-```bash
-gcloud auth configure-docker REGION-docker.pkg.dev
-docker build -t REGION-docker.pkg.dev/PROJECT_ID/smartpark/api:TAG .
-docker push REGION-docker.pkg.dev/PROJECT_ID/smartpark/api:TAG
-```
-
-The Kubernetes Deployment replaces `REGION`, `PROJECT_ID`, and `TAG` in its
-image field. The initContainer downloads one model per new Pod into `emptyDir`;
-changing `MODEL_URI` therefore requires `kubectl rollout restart deployment/smartpark-api`.
-
-Create the car-park ConfigMap referenced by `k8s/deployment.yaml`, then apply the
-model configuration and Deployment:
-
-```bash
-kubectl create configmap smartpark-carparks \
-   --from-file=carparks.json=config/carparks.json \
-   --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f k8s/model-configmap.yaml
-kubectl apply -f k8s/deployment.yaml
-```
 - Locust script + benchmark report for 1/2/4/8 replicas.

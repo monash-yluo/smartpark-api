@@ -159,17 +159,179 @@ kubectl logs -l app=smartpark-api -c smartpark-api \
 不可用行仍保留停车场 ID 和名称，但 `available_spaces`、`confidence_score`、
 `created_at` 返回 `null`。这样可以区分摄像头/推理失败和“当前空位为 0”。
 
-## 后续步骤
+## 在 GKE 上部署（重点）
 
-- GKE 清单（命名空间、ConfigMap、节点服务账号 IAM 权限、Deployment、LoadBalancer Service、HPA）以及实际部署。模型使用 GCS + initContainer + 共享 `emptyDir`，而不是 PVC。
+下面的流程适用于本仓库当前的清单。`k8s/deployment.yaml` 会引用两个
+ConfigMap：`smartpark-carparks` 和 `smartpark-model-config`。其中模型 ConfigMap
+是必需的；如果漏掉它，`download-model` initContainer 会因为找不到
+`MODEL_URI` 而失败，API Pod 不会进入 Ready 状态。
 
-## 运行时模型部署
+当前 `k8s/` 目录包含 API Deployment、Redis Deployment/Service、模型 ConfigMap
+和车场 ConfigMap 的生成命令，但没有单独的 LoadBalancer Service 或 HPA 清单。
+下面的 `kubectl expose` 和 `kubectl autoscale` 会创建这两个资源。
 
-模型文件会被有意排除在 Docker 构建上下文和镜像之外。
-请将模型上传到私有 GCS 存储桶，将 `MODEL_URI` 设置在
-`k8s/model-configmap.yaml` 中，并授予 GKE 节点池服务账号
-`storage.objects.get`（或 `roles/storage.objectViewer`）权限。Deployment 不会指定
-`serviceAccountName`；Pod 使用命名空间 `default` 的 ServiceAccount，并通过当前集群配置中的节点身份访问 GCS。
+### 1. 设置项目、区域并连接 GKE
+
+先确保本机已安装并登录 `gcloud`、`kubectl`，并已启用 Artifact Registry、
+Kubernetes Engine 和 Cloud Storage API：
+
+```bash
+export PROJECT_ID="YOUR_GCP_PROJECT"
+export REGION="australia-southeast2"
+export ZONE="australia-southeast2-a"
+export CLUSTER_NAME="YOUR_GKE_CLUSTER"
+export MODEL_URI="gs://YOUR_BUCKET/model.pt"
+
+gcloud config set project "$PROJECT_ID"
+gcloud container clusters get-credentials "$CLUSTER_NAME" \
+   --zone "$ZONE" --project "$PROJECT_ID"
+kubectl get nodes
+```
+
+如果使用区域集群，把 `--zone` 换成 `--region "$REGION"`。后续命令都应在
+仓库根目录（包含 `k8s/` 的目录）执行，并确认 `kubectl` 当前 context 是目标集群。
+
+### 2. 准备 GCS 模型和节点 IAM 权限
+
+模型不会打进 Docker 镜像。先上传模型，并确认对象非空：
+
+```bash
+gcloud storage cp model.pt "$MODEL_URI"
+gcloud storage ls -l "$MODEL_URI"
+```
+
+当前 Deployment 没有设置 `serviceAccountName`，所以 initContainer 使用 GKE
+节点池服务账号的 Google 身份访问 GCS。查询节点服务账号并授予最小的对象读取权限：
+
+```bash
+NODE_SA=$(gcloud container clusters describe "$CLUSTER_NAME" \
+   --zone "$ZONE" --project "$PROJECT_ID" \
+   --format='value(nodeConfig.serviceAccount)')
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+   --member="serviceAccount:${NODE_SA}" \
+   --role="roles/storage.objectViewer"
+```
+
+如果集群使用 Workload Identity，建议改为 Kubernetes ServiceAccount + IAM
+绑定，并在 Deployment 中设置 `serviceAccountName`；不要把服务账号 JSON key
+放进镜像或 ConfigMap。使用旧式节点 scope 的 Standard 集群还必须允许节点访问
+Cloud Storage（通常创建节点池时使用 `cloud-platform` scope）。
+
+### 3. 构建并推送 API 镜像
+
+把 `k8s/deployment.yaml` 中的 `image` 改成实际推送的镜像地址，然后推送：
+
+```bash
+gcloud services enable artifactregistry.googleapis.com container.googleapis.com \
+   storage.googleapis.com
+gcloud auth configure-docker "${REGION}-docker.pkg.dev"
+docker build -t "${REGION}-docker.pkg.dev/${PROJECT_ID}/smartpark/api:v1" .
+docker push "${REGION}-docker.pkg.dev/${PROJECT_ID}/smartpark/api:v1"
+```
+
+如果 Artifact Registry 仓库尚未创建，先执行：
+
+```bash
+gcloud artifacts repositories create smartpark \
+   --repository-format=docker --location="$REGION" \
+   --description="SmartPark container images"
+```
+
+### 4. 按依赖顺序应用 Kubernetes 资源
+
+模型 ConfigMap 这一步不能省略。修改 `MODEL_URI` 后重新应用 ConfigMap，
+并重启 Deployment，Pod 才会重新下载模型：
+
+```bash
+kubectl create configmap smartpark-carparks \
+   --from-file=carparks.json=config/carparks.json \
+   --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl apply -f k8s/model-configmap.yaml
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/deployment.yaml
+
+kubectl rollout status deployment/smartpark-redis
+kubectl rollout status deployment/smartpark-api
+kubectl get pods -l app=smartpark-api -o wide
+```
+
+用以下命令确认模型 ConfigMap 的值确实已进入集群（不会打印模型内容）：
+
+```bash
+kubectl get configmap smartpark-model-config -o jsonpath='{.data.MODEL_URI}'; echo
+kubectl get pods -l app=smartpark-api
+kubectl describe pod -l app=smartpark-api | grep -A5 -E 'Init Containers|State|Reason'
+```
+
+如果 initContainer 失败，先看它的日志：
+
+```bash
+kubectl logs -l app=smartpark-api -c download-model --tail=100
+```
+
+常见原因是模型 URI 错误、节点服务账号没有 `storage.objects.get`、镜像地址
+错误，或模型对象为空。只有看到 API 容器启动并输出 `detector=real-yolo`，才算
+确认加载了真实模型；否则应用可能退回 `MockDetector`。
+
+### 5. 创建公网 LoadBalancer 和 CPU HPA
+
+API Deployment 暴露容器端口 8000，但当前仓库没有 Service 清单。执行：
+
+```bash
+kubectl expose deployment smartpark-api \
+   --name=smartpark-api-service --type=LoadBalancer \
+   --port=80 --target-port=http
+kubectl get service smartpark-api-service -w
+```
+
+拿到 `EXTERNAL-IP` 后测试：
+
+```bash
+export API_URL="http://EXTERNAL_IP"
+curl "$API_URL/healthz"
+curl "$API_URL/"
+```
+
+创建 HPA 前确认集群提供 Metrics API：
+
+```bash
+kubectl top pods
+```
+
+如果该命令有指标，再创建 1 到 8 副本、CPU 目标 70% 的 HPA：
+
+```bash
+kubectl autoscale deployment smartpark-api \
+   --name=smartpark-api-hpa --cpu-percent=70 --min=1 --max=8
+kubectl get hpa smartpark-api-hpa
+```
+
+HPA 依赖 Deployment 中的 CPU `requests`；本清单已设置 `500m`。压测前应观察：
+
+```bash
+kubectl get deployment smartpark-api
+kubectl get hpa smartpark-api-hpa -w
+kubectl get pods -l app=smartpark-api
+```
+
+### 6. 更新配置或模型
+
+修改 `config/carparks.json` 后重新生成 `smartpark-carparks` ConfigMap；修改
+模型对象后更新 `k8s/model-configmap.yaml`。两种变更都需要重启 API Deployment，
+因为车场配置在应用启动时读取，模型在 initContainer 中下载：
+
+```bash
+kubectl create configmap smartpark-carparks \
+   --from-file=carparks.json=config/carparks.json \
+   --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f k8s/model-configmap.yaml
+kubectl rollout restart deployment/smartpark-api
+kubectl rollout status deployment/smartpark-api
+```
+
+Redis 是单副本、非持久化的短期运营数据存储。Redis 重启会清除最近 30 秒的
+用户统计和共享分析缓存，但不会改变模型文件，也不会让核心 API 的进程退出。
 
 ### 部署集群内 Redis
 
@@ -250,25 +412,5 @@ detector=real-yolo
 ```
 
 `detector=mock` 表示找不到模型文件或模型无法加载。仅凭 Base64 图片长度无法区分真实 YOLO 和 MockDetector；MockDetector 会返回原始图片，不会绘制检测框。
-
-构建轻量镜像并推送到 Artifact Registry：
-
-```bash
-gcloud auth configure-docker REGION-docker.pkg.dev
-docker build -t REGION-docker.pkg.dev/PROJECT_ID/smartpark/api:TAG .
-docker push REGION-docker.pkg.dev/PROJECT_ID/smartpark/api:TAG
-```
-
-Kubernetes Deployment 会在镜像字段中替换 `REGION`、`PROJECT_ID` 和 `TAG`。initContainer 会将每个新 Pod 所需的一个模型下载到 `emptyDir` 中；因此修改 `MODEL_URI` 后需要执行 `kubectl rollout restart deployment/smartpark-api`。
-
-创建 `k8s/deployment.yaml` 引用的停车场 ConfigMap，然后应用模型配置和 Deployment：
-
-```bash
-kubectl create configmap smartpark-carparks \
-   --from-file=carparks.json=config/carparks.json \
-   --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f k8s/model-configmap.yaml
-kubectl apply -f k8s/deployment.yaml
-```
 
 - Locust 脚本 + 1/2/4/8 个副本的基准测试报告。
