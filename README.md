@@ -224,7 +224,7 @@ Unavailable rows retain the car park ID and name but return `null` for
 `available_spaces`, `confidence_score`, and `created_at`. This distinguishes a
 failed camera or analysis from a car park with zero free spaces.
 
-## Deploy on GKE (重点)
+## Deploy on GKE
 
 This section matches the manifests currently in this repository. The API
 Deployment references two ConfigMaps: `smartpark-carparks` and

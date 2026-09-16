@@ -103,6 +103,7 @@ def load_platform_config() -> PlatformConfig:
 
     model_path = Path(os.getenv("MODEL_PATH", "/models/model.pt")).resolve()
 
+    # get all path
     request_cache_ttl_s = int(os.getenv("REQUEST_CACHE_TTL", "30"))
     request_cache_refresh_after_s = int(
         os.getenv("REQUEST_CACHE_REFRESH_AFTER", "20")
