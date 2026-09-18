@@ -8,3 +8,6 @@ model/
 *.pt
 scripts/response.json
 locust_screenshot/*
+
+/doc
+/scripts
