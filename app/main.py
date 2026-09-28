@@ -456,6 +456,7 @@ async def _get_carpark_analysis(carpark: CarPark) -> dict | None:
                 checked_levels,
                 carpark.id,
             )
+            # create a new task to fetch
             task = asyncio.create_task(_load_and_cache_carpark_analysis(carpark))
             app.state.inflight_analyses[carpark.id] = task
 
