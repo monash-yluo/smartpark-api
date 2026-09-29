@@ -111,7 +111,7 @@ spec:
               port: http
           resources:
             requests:
-              cpu: 1200m
+              cpu: 1000m
               memory: 1Gi
             limits:
               cpu: "2"
